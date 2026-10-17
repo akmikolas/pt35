@@ -1,0 +1,62 @@
+'\" -*- coding: utf-8 -*-
+.TH PT35-HELP 1 "2026-10-16" "PocketTerm35" "User Commands"
+.SH NAME
+pt35-help \- show help for PocketTerm35 custom commands
+.SH SYNOPSIS
+.B pt35-help
+.RI [ command ]
+.br
+.B pt35-help
+.RI [ keyword ]
+.br
+.B pt35-help
+.B --all
+.SH DESCRIPTION
+Scans
+.I /usr/local/bin
+for scripts carrying a
+.B "# help: category | description"
+metadata header and lists them grouped by category.
+.PP
+With no arguments all commands are listed. With an argument:
+.IP \(bu 2
+a known command name shows detailed usage (including the
+.B usage
+block extracted from the script itself);
+.IP \(bu 2
+anything else is treated as a keyword, matched against command names,
+descriptions and categories.
+.SH OPTIONS
+.TP
+.B --all
+List everything, including scripts without metadata.
+.TP
+.B --raw
+Plain text (no colour), for piping into a pager.
+.SH EXAMPLES
+.nf
+pt35-help                # list all commands
+pt35-help wifi           # detailed usage for wifi
+pt35-help network        # search by keyword or category
+pt35-help --raw | less   # browse in a pager
+pt35 <TAB>               # bash completion
+.fi
+.SH NOTES
+Command metadata lives in the scripts themselves, so the help text can never
+drift out of sync with the code, and no separate command list has to be
+maintained.
+.PP
+.B pt35-help
+never executes the scripts it documents \(em it parses them. This is
+deliberate: an earlier implementation ran
+.I "<command> --help"
+to gather extra output, which caused
+.B pt35-help pt35-poweroff
+to actually power the machine off.
+.SH SEE ALSO
+.BR zhdesk (1),
+.BR zhfont (1),
+.BR zhime (1),
+.BR wifi (1),
+.BR temp (1),
+.BR pt35-healthcheck (1)

@@ -1,0 +1,238 @@
+#!/bin/bash
+# help: 显示 | 控制共振风格的系统欢迎页（登录终端自动显示）
+#
+# 用法:
+#   pt35-motd              显示欢迎页
+#   pt35-motd --brief      精简版（一行状态）
+#   pt35-motd --no-color   纯文本（无语色）
+#   pt35-motd -h|--help    显示本帮助
+#
+# ★★ 性能要求：必须快（这是交互式 shell 启动路径）★★
+#   初版实测 2349 ms —— 太慢，每次开终端/SSH 都卡 2.3 秒。
+#   原因：vlen() 里对【每个字符】调用 _dw()（$() 子shell），
+#         一行 50 字符 × 多行 + _dw 内部又 2 个 $() = 上千次 fork。
+#   本版全部改成 bash 内建运算（printf -v / 模式替换），零 fork。
+#
+# ★★ 三个显示层踩坑（真机实测）★★
+# 1) 终端尺寸不能靠字号推算：foot 在 640x480/11pt 下是 80 列 × 24 行
+#    （按字号推算成 95x38 是错的）。必须 tput 实测。
+# 2) ★ 块字符（█ ▓ ░ ▒ ▄ ▀）是【双宽】的！DejaVu Sans Mono 缺这些字形，
+#    foot 回退到 Noto Sans Mono CJK（全角=2 列）。
+#    实测 ▓×10 占 13.4 列、▄×10 占 24.6 列，而 X×20 正好 20.0 列。
+#    → 所以正文【只用纯 ASCII】，宽度才可靠。
+# 3) foot 的 CJK 宽度与 wcwidth 不一致 → 正文也不放中文，
+#    中文留给命令自己输出（wifi/temp 的中文界面不受影响）。
+#
+# 美学: 用 ASCII 表达《控制：共振》的机构终端风格 ——
+#       冷灰白 + 单一高饱和红，方正框架、仪表条、档案头。
+#
+# 安装:
+#   ~/.bashrc 里（交互式）:  /usr/local/bin/pt35-motd
+#   登录 shell:            ln -sf /usr/local/bin/pt35-motd /etc/profile.d/99-pt35-motd.sh
+
+set -u
+
+NO_COLOR=0; BRIEF=0
+case "${1:-}" in
+    -h|--help)  sed -n '3,26p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    --brief)    BRIEF=1 ;;
+    --no-color) NO_COLOR=1 ;;
+esac
+[ -t 1 ] || NO_COLOR=1
+
+if [ "$NO_COLOR" = "1" ]; then
+    R=''; BOLD=''; GRAY=''; DIM=''; DARK=''; RED=''; DRED=''; GREEN=''
+else
+    R=$'\033[0m'; BOLD=$'\033[1;37m'; GRAY=$'\033[37m'
+    DIM=$'\033[90m'; DARK=$'\033[2;37m'; RED=$'\033[1;31m'
+    DRED=$'\033[31m'; GREEN=$'\033[32m'
+fi
+
+# ── 零 fork 工具函数 ──────────────────────────────────────
+# 剥离 ANSI（bash 模式替换，无子进程）
+
+# ★ 显示宽度：零 fork 实现（性能关键）
+#   初版每字符调一次 _dw() 子shell → 405ms。
+#   现在：ANSI 用 ${var//} 一次剥掉，非 ASCII 才查码点，
+#   且**结果缓存**（同一字符串只算一次）。目标 <60ms。
+declare -A _VLEN_CACHE=()
+vlen() {
+    local s=$1
+    # ① 纯 bash 剥离 ANSI（不用 sed —— sed 的 [0-9;]*m 会误删正常内容如 "100m"）
+    local out='' rest
+    while [[ $s == *$'\033['* ]]; do
+        out+="${s%%$'\033['*}"
+        rest="${s#*$'\033['}"
+        s="${rest#*m}"
+    done
+    s="$out$s"
+    # ② 缓存（同一字符串只算一次）
+    local hit=${_VLEN_CACHE[$s]:-}
+    if [ -n "$hit" ]; then printf '%s' "$hit"; return; fi
+    # ③ 快速路径：纯 ASCII → 宽度 == 字符数
+    if [[ $s != *[$'\x80'-$'\xff']* ]]; then
+        _VLEN_CACHE[$s]=${#s}
+        printf '%d' "${#s}"; return
+    fi
+    # ④ 含非 ASCII：逐字符判定（CJK = 2 列）
+    local n=0 i ch cp
+    for (( i=0; i<${#s}; i++ )); do
+        ch=${s:i:1}
+        if [[ $ch < $'\x80' ]]; then n=$(( n + 1 )); continue; fi
+        printf -v cp '%d' "'$ch"
+        if   (( cp >= 0x2E80 && cp <= 0x303E )); then n=$(( n + 2 ))
+        elif (( cp >= 0x3041 && cp <= 0x33FF )); then n=$(( n + 2 ))
+        elif (( cp >= 0x3400 && cp <= 0x4DBF )); then n=$(( n + 2 ))
+        elif (( cp >= 0x4E00 && cp <= 0x9FFF )); then n=$(( n + 2 ))
+        elif (( cp >= 0xAC00 && cp <= 0xD7A3 )); then n=$(( n + 2 ))
+        elif (( cp >= 0xF900 && cp <= 0xFAFF )); then n=$(( n + 2 ))
+        elif (( cp >= 0xFE30 && cp <= 0xFE6F )); then n=$(( n + 2 ))
+        elif (( cp >= 0xFF00 && cp <= 0xFF60 )); then n=$(( n + 2 ))
+        else n=$(( n + 1 ))
+        fi
+    done
+    _VLEN_CACHE[$s]=$n
+    printf '%d' "$n"
+}
+
+# 重复字符 N 次（带缓存 —— ${var//} 是逐字符替换，78 字符要跑 78 次 printf）
+declare -A _REP_CACHE=()
+_rep() {  # _rep <字符> <次数>
+    local key="$1:$2" s
+    s=${_REP_CACHE[$key]:-}
+    if [ -z "$s" ]; then
+        printf -v s '%*s' "$2" ''
+        s="${s// /$1}"
+        _REP_CACHE[$key]=$s
+    fi
+    printf '%s' "$s"
+}
+
+COLS=$(tput cols 2>/dev/null || echo 80)
+case "$COLS" in ''|*[!0-9]*) COLS=80 ;; esac
+W=$(( COLS - 2 ))
+[ "$W" -gt 100 ] && W=100
+[ "$W" -lt 60 ] && W=60
+BARW=20
+[ "$W" -lt 74 ] && BARW=14
+
+# ── 采集状态（★ 一次性批量查询服务，避免 10 次 systemctl = 155ms）──
+MODEL=$( { tr -d '\0' < /proc/device-tree/model; } 2>/dev/null ); MODEL=${MODEL:-Unknown}
+ARCH=$(uname -m); KERNEL=$(uname -r)
+HOSTN=$(cat /etc/hostname 2>/dev/null); HOSTN=${HOSTN:-pda}
+NPROC=$(nproc 2>/dev/null || echo '?')
+UP=$(uptime -p 2>/dev/null | sed 's/^up //'); UP=${UP:-?}
+
+TEMP_RAW=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo 0)
+case "$TEMP_RAW" in ''|*[!0-9]*) TEMP_RAW=0 ;; esac
+TEMP=$(( TEMP_RAW / 1000 ))
+TEMP1=$(awk -v t="$TEMP_RAW" 'BEGIN{printf "%.1f", t/1000}')
+
+MEM_H=$(free -h 2>/dev/null | awk '/^Mem:/{sub(/i$/,"",$3);sub(/i$/,"",$2);print $3"/"$2}')
+MEM_PCT=$(free 2>/dev/null | awk '/^Mem:/{printf "%d", $3*100/$2}'); MEM_PCT=${MEM_PCT:-0}
+DISK_H=$(df -h / 2>/dev/null | awk 'NR==2{sub(/i$/,"",$3);sub(/i$/,"",$2);print $3"/"$2}')
+DISK_PCT=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"");print $5}'); DISK_PCT=${DISK_PCT:-0}
+
+WLAN_IP=$(ip -4 -br addr show wlan0 2>/dev/null | awk '{print $3}')
+TS_IP=$(timeout 2 tailscale ip -4 2>/dev/null | head -1)
+SSID=$(iw dev wlan0 link 2>/dev/null | awk '/SSID/{sub(/^[ \t]*SSID:[ \t]*/,"");print}')
+SSID=${SSID:-disconnected}
+
+# 一次 systemctl 拿到全部服务的 active 状态（原来 10 次 = 155ms）
+declare -A SVC_ON=()
+while read -r nm st; do
+    [ "$st" = "active" ] && SVC_ON[$nm]=1
+done < <(systemctl is-active sshd tailscaled NetworkManager xray-knife-proxy seatd 2>/dev/null | paste -d' ' <(printf '%s\n' sshd tailscaled NetworkManager xray-knife-proxy seatd) -)
+
+svc() { [ -n "${SVC_ON[$1]:-}" ] && printf '%sON%s' "$GREEN" "$R" \
+                                  || printf '%sOFF%s' "$RED" "$R"; }
+svct() { [ -n "${SVC_ON[$1]:-}" ] && echo 1 || echo 0; }
+
+if   [ "$TEMP" -ge 65 ]; then TCOL=$RED
+elif [ "$TEMP" -ge 55 ]; then TCOL=$DRED
+else                          TCOL=$GREEN; fi
+
+declare -A _BAR_CACHE=()
+bar() {
+    local pct=$1 w=$2 col=$3 key body
+    case "$pct" in ''|*[!0-9]*) pct=0 ;; esac
+    [ "$pct" -gt 100 ] && pct=100
+    key="$pct:$w:$col"
+    body=${_BAR_CACHE[$key]:-}
+    if [ -z "$body" ]; then
+        local f e
+        f=$(( pct * w / 100 )); e=$(( w - f ))
+        body="$( _rep '#' "$f" )${DIM}$( _rep '.' "$e" )$R"
+        _BAR_CACHE[$key]=$body
+    fi
+    printf '%s%s' "$col" "$body"
+}
+
+if [ "$BRIEF" = "1" ]; then
+    printf '%s%s%s %s%s%s %s%.1fC%s mem %s%% disk %s%% %s%s%s\n' \
+        "$DIM" "$HOSTN" "$R" "$GRAY" "$ARCH" "$R" "$TCOL" "$TEMP1" "$R" \
+        "$MEM_PCT" "$DISK_PCT" "$DIM" "${WLAN_IP:-—}" "$R"
+    exit 0
+fi
+
+# ── 渲染（每行严格 W 列）─────────────────────────────────
+line() {
+    local c=$1 n
+    n=$(( W - $(vlen "$c") )); [ "$n" -lt 0 ] && n=0
+    printf '%s%*s\n' "$c" "$n" ''
+}
+rule() { line "$DIM$(_rep '=' "$W")$R"; }
+dash() { line "$DIM$(_rep '-' "$W")$R"; }
+frame() {
+    local c=$1 inner=$(( W - 4 )) n
+    n=$(( inner - $(vlen "$c") )); [ "$n" -lt 0 ] && n=0
+    printf '%s|%s %s%*s %s|%s\n' "$DIM" "$R" "$c" "$n" '' "$DIM" "$R"
+}
+
+echo
+SEAL_TXT="[ SIGNAL STABLE ]"; SEAL_COL=$GREEN
+ALL_ON=1
+for u in sshd tailscaled NetworkManager xray-knife-proxy seatd; do
+    [ -n "${SVC_ON[$u]:-}" ] || ALL_ON=0
+done
+[ "$ALL_ON" = "0" ] && { SEAL_TXT="[ SIGNAL DEGRADED ]"; SEAL_COL=$RED; }
+TITLE="FEDERAL BUREAU OF CONTROL / POCKET TERMINAL UNIT"
+GAP=$(( W - 1 - ${#TITLE} - ${#SEAL_TXT} ))
+[ "$GAP" -lt 1 ] && GAP=1
+printf ' %s%s%s%*s%s%s%s\n' "$DARK" "$TITLE" "$R" "$GAP" '' "$SEAL_COL" "$SEAL_TXT" "$R"
+rule
+
+line "$(printf '  %sHOST%s %s%-10s%s %sARCH%s %s%-9s%s %sKERNEL%s %s%s%s' \
+    "$DIM" "$R" "$BOLD" "$HOSTN" "$R" "$DIM" "$R" "$GRAY" "$ARCH" "$R" \
+    "$DIM" "$R" "$GRAY" "$KERNEL" "$R")"
+line "$(printf '  %sHW%s   %s%-10s%s %sCPU%s %sx%-8s%s %sUP%s %s%s%s' \
+    "$DIM" "$R" "$GRAY" "$(printf '%s' "$MODEL" | sed 's/^Raspberry Pi /RPi /;s/ Model B//')" "$R" \
+    "$DIM" "$R" "$GRAY" "$NPROC" "$R" "$DIM" "$R" "$GRAY" "$UP" "$R")"
+
+line "$DIM+$(_rep '-' $(( W - 2 )))+$R"
+gauge() {
+    local label=$1 pct=$2 col=$3 val=$4 b
+    b=$(bar "$pct" "$BARW" "$col")
+    frame "$(printf '%s%-9s%s  %s  %s%s%s' "$DARK" "$label" "$R" "$b" "$DARK" "$val" "$R")"
+}
+gauge "RESONANCE" $(( TEMP * 100 / 85 )) "$TCOL" "$(printf '%.1fC' "$TEMP1")   "
+gauge "MEMORY"    "$MEM_PCT"  "$DRED" "$(printf '%-9s' "$MEM_H")"
+gauge "STORAGE"   "$DISK_PCT" "$DRED" "$(printf '%-9s' "$DISK_H")"
+frame "$(printf '%ssshd%s %s  %sts%s %s  %snet%s %s  %sprox%s %s  %sseat%s %s' \
+    "$DARK" "$R" "$(svc sshd)" "$DARK" "$R" "$(svc tailscaled)" \
+    "$DARK" "$R" "$(svc NetworkManager)" "$DARK" "$R" "$(svc xray-knife-proxy)" \
+    "$DARK" "$R" "$(svc seatd)")"
+line "$DIM+$(_rep '-' $(( W - 2 )))+$R"
+
+NET="  ${DIM}LINK${R}  ${GRAY}${WLAN_IP:-—}${R}  ${DARK}${SSID}${R}"
+[ -n "$TS_IP" ] && NET="$NET  ${DIM}/${R}  ${GRAY}${TS_IP}${R}"
+line "$NET"
+
+dash
+line "$(printf '  %sQUICK%s  %spt35%s cmds  %s|%s  %swifi%s  %s|%s  %stemp%s' \
+    "$DARK" "$R" "$BOLD" "$R" "$DIM" "$R" "$BOLD" "$R" "$DIM" "$R" "$BOLD" "$R")"
+line "$(printf '         %spt35-help%s  %s|%s  %spt35-healthcheck%s  %s|%s  %szhime%s' \
+    "$BOLD" "$R" "$DIM" "$R" "$BOLD" "$R" "$DIM" "$R" "$BOLD" "$R")"
+dash
+line "$(printf '  %s> RESONANCE AMPLIFIER ONLINE%s  %s//%s  %sHEDRON STABLE%s' \
+    "$DARK" "$R" "$DIM" "$R" "$DARK" "$R")"

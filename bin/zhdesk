@@ -1,0 +1,277 @@
+#!/bin/bash
+# help: 桌面 | 进入中文桌面（sway + foot + fcitx5）
+# zhdesk —— 启动极简中文桌面（sway + foot + fcitx5）
+#
+# ── 为什么需要这个 ──────────────────────────────────────────
+# 纯终端（kmscon）下无法使用输入法：fcitx5 依赖显示服务器的 text-input 协议。
+# 要打中文就必须有合成器，这是最小代价方案（sway 无面板/无壁纸）。
+#
+# ── 与 kmscon 的关系（关键）─────────────────────────────────
+# kmscon 和 sway **都要独占 DRM master**，不能同时显示。
+# 实测：kmscon 占着 tty1 时，sway 报
+#       "connector HDMI-A-1: Atomic commit failed: Permission denied"
+# 所以本脚本会先停掉 kmscon，退出 sway 后再恢复它。
+#
+# ── ★ fcitx5 的启动顺序（这是最容易踩的坑）─────────────────
+# fcitx5 **必须在 sway 起来之后**启动，且环境里要有 WAYLAND_DISPLAY，
+# 否则它连不上合成器：表现为
+#     State=0  CurrentInputMethod=""    → 打字没有候选框
+# 我因为从 SSH 手动重启 fcitx5（那时没有 Wayland 显示）踩过这个坑，
+# 排查了很久。所以这里用**轮询等 socket 出现**再启动 fcitx5。
+#
+# ── 用法 ────────────────────────────────────────────────────
+#   zhdesk                    进入中文桌面（默认拼音）
+#                              ★ 会自动脱离当前终端，可在 kmscon 里安全执行
+#   ZHDESK_LANG=en zhdesk     进入桌面但默认英文
+#   zhime en / zh / toggle    桌面内切换中英文
+#   在 sway 里按 Super+Shift+e 退出 → 自动切回 kmscon
+#   若异常退出：systemctl start kmsconvt@tty1 && chvt 1
+set -u
+
+# ── 参数处理 ────────────────────────────────────────────────
+case "${1:-}" in
+    -h|--help)
+        cat <<'USAGE'
+zhdesk —— 进入 PocketTerm35 中文桌面（sway + foot + fcitx5）
+
+用法:
+  zhdesk                    进入中文桌面（默认拼音输入法）
+  ZHDESK_LANG=en zhdesk     进入桌面但默认英文
+  ZHDESK_VT=3 zhdesk        指定虚拟终端号（默认 2）
+  zhdesk -h|--help          显示本帮助
+
+行为说明:
+  * 会先停掉 kmscon 释放 DRM master，再启动 sway
+  * 会自动脱离当前终端（setsid），所以在 kmscon 里执行是安全的
+  * 已有 sway 在跑时不会重复启动（seatd 的 seat0 只允许一个 client）
+  * 退出桌面（Super+Shift+E）后自动恢复 kmscon
+
+相关命令:
+  pt35-desktop-boot         管理桌面开机自启（推荐用这个而非 zhdesk）
+  zhime                     桌面内切换中英文
+  zhfont                    调整桌面终端字号
+
+注意: 本脚本会自行脱离终端执行，若用 systemd 管理请用 pt35-desktop.service
+USAGE
+        exit 0
+        ;;
+esac
+
+# ── ★ 自脱离（关键修复）──────────────────────────────────────
+# 问题：本脚本会停掉 kmscon，而用户往往【就是从 kmscon 里敲 zhdesk 的】。
+#       停掉 kmscon = 杀掉调用者的终端 → 脚本收到 SIGHUP 一起死。
+#       现象：日志只有"停止 kmscon"+"恢复 kmscon"两行，sway 根本没起来。
+# 解决：检测到自己不是"脱离会话"状态时，用 systemd-run 重新启动自己。
+#       systemd-run 会让进程属于 systemd 而非用户的登录会话，
+#       因此后续 systemctl stop kmscon 不会波及本进程。
+if [ -z "${ZHDESK_DETACHED:-}" ]; then
+    if command -v setsid >/dev/null 2>&1; then
+        # setsid 让本脚本进入【新的会话且无控制终端】，
+        # 因此后面 systemctl stop kmscon 发出的 SIGHUP 无法送达本进程。
+        setsid env ZHDESK_DETACHED=1 \
+              ZHDESK_VT="${ZHDESK_VT:-2}" \
+              ZHDESK_LANG="${ZHDESK_LANG:-zh}" \
+              "$0" </dev/null >/tmp/zhdesk-launch.log 2>&1 &
+        echo "zhdesk 已在后台启动（脱离当前终端）"
+        echo "  桌面就绪后请按 Ctrl+Alt+F$(( ${ZHDESK_VT:-2} )) 切换过去"
+        echo "  日志: /tmp/zhdesk.log   启动日志: /tmp/zhdesk-launch.log"
+        exit 0
+    fi
+    export ZHDESK_DETACHED=1
+fi
+
+# 双保险：忽略 SIGHUP（即使 setsid 不可用也不会被终端关闭带走）
+trap '' HUP
+
+VT="${ZHDESK_VT:-2}"
+LOG=/tmp/zhdesk.log
+export HOME=/root
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=sway
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG"; }
+
+# ── 前置检查 ────────────────────────────────────────────────
+missing=""
+for b in sway foot fcitx5; do
+    command -v "$b" >/dev/null 2>&1 || missing="$missing $b"
+done
+if [ -n "$missing" ]; then
+    echo "缺少组件:$missing" >&2
+    echo "请先: pacman -S sway foot fcitx5 fcitx5-chinese-addons" >&2
+    exit 1
+fi
+
+if [ ! -c "/dev/tty$VT" ]; then
+    echo "VT /dev/tty$VT 不存在；试 ZHDESK_VT=3 zhdesk" >&2
+    exit 1
+fi
+
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# 输入法模块（客户端侧：让 foot 等程序去找 fcitx5）
+export GTK_IM_MODULE=fcitx
+export QT_IM_MODULE=fcitx
+export XMODIFIERS=@im=fcitx
+export SDL_IM_MODULE=fcitx
+
+export LANG=zh_CN.UTF-8
+export LC_CTYPE=zh_CN.UTF-8
+
+# sway 渲染器：pixman 缺 allocator，必须用 gles2（实测）
+export WLR_RENDERER="${WLR_RENDERER:-gles2}"
+export WLR_NO_HARDWARE_CURSORS=1
+export LIBSEAT_BACKEND=seatd
+
+# ── 恢复 kmscon（退出时调用）───────────────────────────────
+KMS_ACTIVE=0
+FCITX_PID=""
+cleanup() {
+    if [ -n "$FCITX_PID" ] && kill -0 "$FCITX_PID" 2>/dev/null; then
+        log "停止 fcitx5 (pid $FCITX_PID)"
+        kill "$FCITX_PID" 2>/dev/null
+    fi
+    # 恢复 kmscon 只在【交互式运行】时做。
+    # 在 systemd 单元下运行时不插手：那块由 pt35-desktop.service 的
+    # ExecStopPost（脱离 cgroup 的异步恢复）负责。
+    # 原因：systemd 停止服务时会向整个 cgroup 发 SIGTERM，这里调用的
+    # `systemctl start kmsconvt@tty1` 会被 SIGKILL，导致
+    #   State 'stop-sigterm' timed out. Killing.
+    #   State 'stop-post' timed out
+    #   → 服务变 failed 且白等 20 秒。实测踩过。
+    if [ "$KMS_ACTIVE" = "1" ] && [ -z "${INVOCATION_ID:-}" ]; then
+        log "恢复 kmscon"
+        systemctl start kmsconvt@tty1 2>/dev/null
+    elif [ "$KMS_ACTIVE" = "1" ]; then
+        log "运行在 systemd 单元下，跳过 kmscon 恢复（由 ExecStopPost 负责）"
+    fi
+}
+trap 'cleanup' EXIT INT TERM
+# 注意：HUP 已在上面被忽略，不会触发 cleanup
+
+# ── 让 kmscon 让出 DRM master ───────────────────────────────
+: >"$LOG"
+if systemctl is-active --quiet kmsconvt@tty1; then
+    log "停止 kmscon（释放 DRM master）"
+    KMS_ACTIVE=1
+    systemctl stop kmsconvt@tty1 2>/dev/null
+    sleep 1
+fi
+
+# ── ★ seatd 与 seat 就绪检查（实测踩坑）─────────────────────
+# 真机日志:
+#   [ERROR] Could not add client: seat is VT-bound and has an active client
+#   [ERROR] Could not add client to target seat: Device or resource busy
+#   → sway 报 "Unable to create seat: Broken pipe" 然后退出 (rc=1)
+# 原因：① 旧 sway/pt35-desktop 还持有 seat；② seatd 虽 active 但 socket 未就绪
+# 解决：启动 sway 前做三重检查 —— 服务在跑、socket 存在、旧实例已释放
+
+# 1) 已有 sway 在跑就不重复启动（避免抢同一个 seat）
+if pgrep -x sway >/dev/null 2>&1; then
+    log "检测到已有 sway 在运行（可能来自 pt35-desktop）"
+    if systemctl is-active --quiet pt35-desktop.service; then
+        echo "zhdesk: 桌面已在运行（pt35-desktop 已持有 seat）"
+        echo "  直接按 Ctrl+Alt+F2 切过去即可；如需重启桌面请用:"
+        echo "    systemctl restart pt35-desktop"
+        exit 0
+    fi
+    log "尝试等待旧 sway 退出（最多 10 秒）..."
+    for _ in $(seq 1 20); do
+        pgrep -x sway >/dev/null 2>&1 || break
+        sleep 0.5
+    done
+    if pgrep -x sway >/dev/null 2>&1; then
+        log "旧 sway 仍未退出，强制结束"
+        pkill -x sway 2>/dev/null
+        sleep 2
+    fi
+fi
+
+# 2) 确保 seatd 在跑，并等待 socket 就绪
+systemctl is-active --quiet seatd || systemctl start seatd 2>/dev/null
+SEAT_OK=0
+for _ in $(seq 1 20); do
+    if [ -S /run/seatd.sock ] && systemctl is-active --quiet seatd; then
+        SEAT_OK=1
+        break
+    fi
+    sleep 0.3
+done
+if [ "$SEAT_OK" != "1" ]; then
+    log "警告：seatd socket 未就绪（/run/seatd.sock 缺失或服务异常）"
+    # 尝试硬重启一次 seatd
+    systemctl restart seatd 2>/dev/null
+    for _ in $(seq 1 20); do
+        [ -S /run/seatd.sock ] && { SEAT_OK=1; break; }
+        sleep 0.3
+    done
+fi
+[ "$SEAT_OK" = "1" ] && log "seatd 就绪 (/run/seatd.sock)" || log "seatd 仍不可用，sway 可能失败"
+
+# 3) 等旧 wayland socket 消失（残留 socket 会让新 sway 行为异常）
+for _ in $(seq 1 20); do
+    ls /run/user/0/wayland-* >/dev/null 2>&1 || break
+    sleep 0.3
+done
+
+# ── 启动 sway（后台），等 socket 就绪 ───────────────────────
+log "启动 sway (tty$VT, renderer=$WLR_RENDERER)"
+sway --unsupported-gpu -c /root/.config/sway/config >>"$LOG" 2>&1 &
+SWAY_PID=$!
+
+# 轮询等待 sway 的 wayland socket（最多 20 秒）
+WD=""
+for _ in $(seq 1 40); do
+    sleep 0.5
+    WD=$(ls "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\.lock$' | head -1)
+    [ -n "$WD" ] && break
+    if ! kill -0 "$SWAY_PID" 2>/dev/null; then
+            log "sway 提前退出"
+            # 给出针对性诊断（实测最常见的两类失败）
+            if grep -q "Unable to create seat" "$LOG" 2>/dev/null; then
+                log "  原因: seatd/seat 不可用 —— 可能有其它 sway 持有 seat"
+                log "  排查: systemctl status seatd; pgrep -a sway"
+            elif grep -q "Atomic commit failed" "$LOG" 2>/dev/null; then
+                log "  原因: DRM master 被占用 —— kmscon 未正确停止"
+            fi
+            break
+        fi
+done
+
+if [ -n "$WD" ]; then
+    export WAYLAND_DISPLAY=$(basename "$WD")
+    log "wayland socket 就绪: $WAYLAND_DISPLAY → 启动 fcitx5"
+    # ★ 关键：此时环境里才有 WAYLAND_DISPLAY，fcitx5 才能连上合成器
+    fcitx5 -d --replace >>"$LOG" 2>&1 &
+    FCITX_PID=$!
+    sleep 2
+    # 默认输入法：ZHDESK_LANG=en 则以英文启动（不需要中文时更省事）
+    case "${ZHDESK_LANG:-zh}" in
+        en|EN|english)
+            DEFAULT_IM="keyboard-us"
+            ;;
+        *)
+            DEFAULT_IM="pinyin"
+            ;;
+    esac
+    busctl --user call org.fcitx.Fcitx5 /controller \
+        org.fcitx.Fcitx.Controller1 SetCurrentIM s "$DEFAULT_IM" >/dev/null 2>&1
+    log "fcitx5 已启动 (pid $FCITX_PID)，默认输入法=$DEFAULT_IM"
+else
+    log "警告：未等到 wayland socket，fcitx5 未启动（输入法将不可用）"
+fi
+
+echo "中文桌面运行中 (tty$VT)"
+echo "  输入中文:   直接打拼音，出现候选框后按空格"
+echo "  中英切换:   Ctrl+Space"
+echo "  退出桌面:   Super+Shift+e"
+echo "  日志:       $LOG"
+
+# ── 等待 sway 退出 ──────────────────────────────────────────
+wait "$SWAY_PID"
+rc=$?
+log "sway 退出，返回码 $rc"
+chvt 1 2>/dev/null || true
+exit $rc

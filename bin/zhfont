@@ -1,0 +1,117 @@
+#!/bin/bash
+# help: 桌面 | 调整桌面终端字号
+# zhfont —— 调整中文桌面（foot 终端）的字体大小
+#
+# 背景：foot 1.28 的字体语法坑
+#   ✅ font=DejaVu Sans Mono:size=11      （pt）
+#   ✅ font=DejaVu Sans Mono:pixelsize=16 （px）
+#   ❌ font=DejaVu Sans Mono:size=11px    ← foot 拒绝！会静默退回默认字体
+#   另外 font= 必须写成【一行、逗号分隔】，写两行只有第一行生效。
+#
+# 用法:
+#   zhfont            查看当前设置
+#   zhfont 11         设为 11（pt）
+#   zhfont 11 px      设为 11 像素
+#   zhfont --list     列出可用字体
+#   zhfont --restart  按保存的设置重启桌面
+set -u
+
+CONF=/root/.config/foot/foot.ini
+STATE=/root/.config/foot/.font-size
+LATIN="DejaVu Sans Mono"
+CJK="Noto Sans Mono CJK SC"
+
+grn=$'\033[32m'; yel=$'\033[33m'; dim=$'\033[2m'; rst=$'\033[0m'
+
+cur_size() { [ -f "$STATE" ] && cat "$STATE" || echo "11"; }
+cur_unit() { [ -f "$STATE" ] && sed -n 2p "$STATE" || echo ""; }
+
+case "${1:-}" in
+    --list)
+        echo "可用的等宽字体:"
+        fc-list :spacing=mono family 2>/dev/null | tr ',' '\n' | sort -u | sed 's/^/  /'
+        exit 0
+        ;;
+    --restart)
+        echo "按当前设置重启桌面..."
+        pkill -x sway 2>/dev/null; pkill -x foot 2>/dev/null; pkill -x fcitx5 2>/dev/null
+        sleep 2
+        setsid /usr/local/bin/zhdesk </dev/null >/dev/null 2>&1 &
+        echo "  ${grn}✅${rst} 已重启，请按 Ctrl+Alt+F2 切过去"
+        exit 0
+        ;;
+    "" )
+        S=$(cur_size); U=$(cur_unit)
+        echo "当前字体设置:"
+        grep -E "^font=" "$CONF" 2>/dev/null | sed 's/^/  /'
+        echo "  ${dim}字号: ${S}${U:-pt}${rst}"
+        echo
+        echo "用法: ${grn}zhfont 11${rst}         设 11pt"
+        echo "      ${grn}zhfont 12 px${rst}      设 12 像素"
+        echo "      ${grn}zhfont --restart${rst}   应用并重启桌面"
+        echo "      ${grn}zhfont --list${rst}      列出可用字体"
+        echo
+        echo "  推荐: 11pt（信息量大） / 13-14pt（更易读）"
+        echo "  参考: kmscon 纯终端 = 80x30；桌面默认 11pt ≈ 95x38"
+        exit 0
+        ;;
+esac
+
+# 设置字号
+SIZE="$1"
+UNIT="${2:-}"
+case "$UNIT" in
+    px|pixel|pixels) SPEC="${SIZE}"; UNIT_LABEL="px"; UNIT_KEY="pixelsize" ;;
+    *)               SPEC="${SIZE}"; UNIT_LABEL="pt"; UNIT_KEY="size" ;;
+esac
+
+# 校验：必须是正整数
+case "$SIZE" in
+    ''|*[!0-9]*) echo "${yel}❌${rst} 字号必须是正整数，例如: zhfont 11" >&2; exit 1 ;;
+esac
+if [ "$SIZE" -lt 6 ] || [ "$SIZE" -gt 40 ]; then
+    echo "${yel}⚠️${rst} 字号 $SIZE 超出合理范围（6-40），仍继续" >&2
+fi
+
+# 备份一次
+[ -f "$CONF" ] && [ ! -f "${CONF}.orig" ] && cp -a "$CONF" "${CONF}.orig"
+
+# 生成新配置：font= 必须一行、逗号分隔
+python3 - "$CONF" "$LATIN" "$CJK" "$UNIT_KEY" "$SPEC" <<'PY'
+import re, sys
+conf, latin, cjk, key, spec = sys.argv[1:6]
+try:
+    txt = open(conf, encoding='utf-8').read()
+except FileNotFoundError:
+    txt = ''
+newfont = f"font={latin}:{key}={spec},{cjk}:{key}={spec}"
+if re.search(r'^\s*font\s*=', txt, re.M):
+    # 替换第一处 font=，删除其余 font= 行（避免"第二行覆盖"陷阱）
+    lines = txt.split('\n')
+    out, done = [], False
+    for ln in lines:
+        if re.match(r'^\s*font\s*=', ln):
+            if not done:
+                out.append(newfont); done = True
+            continue
+        out.append(ln)
+    txt = '\n'.join(out)
+else:
+    txt = newfont + '\n' + txt
+open(conf, 'w', encoding='utf-8').write(txt)
+PY
+
+printf '%s\n%s\n' "$SPEC" "$UNIT_LABEL" > "$STATE"
+
+# 语法校验（关键！foot 会静默忽略非法字体）
+ERR=$(foot -c "$CONF" --check-config 2>&1 | grep -E "err:.*font" || true)
+if [ -n "$ERR" ]; then
+    echo "${yel}⚠️${rst} foot 报字体配置错误："
+    echo "  $ERR"
+    echo "  ${dim}（可能该字号/字体不可用，请换一个试试）${rst}"
+else
+    echo "${grn}✅${rst} 字号已设为 ${SIZE}${UNIT_LABEL}"
+fi
+echo "  配置: $(grep -E '^font=' "$CONF" | head -1)"
+echo
+echo "  应用: ${grn}zhfont --restart${rst}   或直接在桌面里按 Ctrl+Shift+加号/减号 临时缩放"

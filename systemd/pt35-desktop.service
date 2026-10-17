@@ -1,0 +1,43 @@
+[Unit]
+Description=PocketTerm35 Chinese desktop (sway + foot + fcitx5)
+Documentation=file:/usr/local/bin/zhdesk
+After=systemd-user-sessions.service seatd.service
+Wants=kmsconvt@tty1.service
+# tty1 belongs to kmscon (rescue console); the desktop owns tty2.
+Conflicts=kmsconvt@tty1.service
+ConditionPathExists=!/etc/pt35-no-desktop
+# ★ StartLimit* must live in [Unit]. In [Service] systemd ignores them
+#   and logs "Unknown key ... ignoring".
+StartLimitBurst=5
+StartLimitIntervalSec=180
+
+[Service]
+Type=simple
+# ★ XDG_RUNTIME_DIR is /run/pt35, NOT /run/user/0.
+#   Reason (measured): with no lingering enabled for root, systemd destroys and
+#   recreates /run/user/0 every time the last session ends — taking the
+#   compositor's WAYLAND socket with it. The compositor keeps running but every
+#   client fails with "no compositor running". /run/pt35 is tied to the unit
+#   lifetime via RuntimeDirectory, so it is stable.
+RuntimeDirectory=pt35
+RuntimeDirectoryMode=0700
+Environment=ZHDESK_DETACHED=1
+Environment=ZHDESK_VT=2
+Environment=ZHDESK_LANG=zh
+Environment=WLR_RENDERER=gles2
+Environment=XDG_RUNTIME_DIR=/run/pt35
+ExecStart=/usr/local/bin/zhdesk
+# KillMode=mixed: SIGTERM only to the main process so zhdesk can run its cleanup.
+KillMode=mixed
+# ★ Stopping must wait for the compositor to release DRM and shut clients down.
+#   That normally takes 3-8 s; 10 s is not enough and produces
+#   "stop-sigterm timed out" followed by SIGKILL, leaving seat/DRM dirty.
+TimeoutStopSec=35
+# kmscon restore must be async AND outside the cgroup: systemd SIGKILLs the whole
+# cgroup on stop, which would kill a synchronous `systemctl start` here.
+ExecStopPost=-systemd-run --collect --quiet --unit=pt35-rescue /usr/local/bin/pt35-desktop-boot --restore
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical.target

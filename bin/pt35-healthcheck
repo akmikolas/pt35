@@ -1,0 +1,147 @@
+#!/bin/bash
+# help: 系统 | 系统健康自检（查文件损坏）
+# pt35-healthcheck —— 系统健康自检
+#
+# 背景：本机因「写入未落盘 + 非正常断电」发生过多轮文件损坏，
+#       特征是【文件大小正确、头部正常、但内容错误】。
+#       普通 ELF 头部检查查不出来，必须用 pacman 的校验和 + 库加载测试。
+#
+# 用法:
+#   pt35-healthcheck          快速检查（约 10 秒）
+#   pt35-healthcheck --full   全量校验和（约 2-5 分钟，最可靠）
+set -u
+
+case "${1:-}" in
+    -h|--help)
+        cat <<'USAGE'
+pt35-healthcheck —— PocketTerm35 系统健康自检
+
+用法:
+  pt35-healthcheck          快速检查（约 10 秒）
+  pt35-healthcheck --full   全量校验和（2-5 分钟，最可靠）
+  pt35-healthcheck -h       显示本帮助
+
+检查项:
+  1. 文件系统状态与磁盘占用
+  2. **关键库能否实际加载**（能查出"头部正常但内容损坏"）
+  3. 关键命令是否存在
+  4. 网络（wlan0/end0/NetworkManager）
+  5. 服务（sshd/tailscaled/kmscon/seatd）
+  6. locale（locale-archive 与 UTF-8 可用性）
+  7. 温度与风扇
+
+为什么需要它:
+  本机因非正常断电损坏过 300+ 文件，特征是"文件大小正确、
+  头部正常、但内容错误"，普通检查查不出来，必须用校验和
+  或实际加载测试。--full 用 pacman -Qkk 做全量校验。
+USAGE
+        exit 0
+        ;;
+esac
+
+RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; RST=$'\033[0m'
+ISSUES=0
+
+ok()   { printf "  ${GRN}✓${RST} %s\n" "$1"; }
+warn() { printf "  ${YEL}!${RST} %s\n" "$1"; ISSUES=$((ISSUES+1)); }
+bad()  { printf "  ${RED}✗${RST} %s\n" "$1"; ISSUES=$((ISSUES+1)); }
+
+echo "══════ PocketTerm35 健康自检 ══════"
+echo
+
+echo "── 1. 文件系统 ──"
+if findmnt -no FSTYPE / >/dev/null 2>&1; then
+    ok "根分区: $(findmnt -no SOURCE,FSTYPE /)"
+else
+    bad "无法读取根分区信息"
+fi
+DF=$(df -h / | tail -1 | awk '{print $5}' | tr -d '%')
+[ "$DF" -lt 90 ] 2>/dev/null && ok "磁盘使用 ${DF}%" || warn "磁盘使用 ${DF}%（偏高）"
+
+echo
+echo "── 2. 关键库能否加载（能查出「头部正常但内容损坏」）──"
+for l in libc.so.6 libz.so.1 libnl-3.so.200 libgdbm.so.6 libtasn1.so.6 \
+         libssh2.so.1 libsystemd.so.0 libdbus-1.so.3 libpcre2-8.so.0; do
+    f=$(readlink -f "/usr/lib/$l" 2>/dev/null)
+    if [ ! -f "$f" ]; then
+        warn "$l 不存在"
+        continue
+    fi
+    if python3 -c "import ctypes; ctypes.CDLL('$f')" >/dev/null 2>&1; then
+        ok "$l"
+    else
+        bad "$l 加载失败（可能损坏）"
+    fi
+done
+
+echo
+echo "── 3. 关键命令 ──"
+for c in pacman nmcli iw wpa_supplicant ip systemctl ssh tailscale locale-gen; do
+    command -v "$c" >/dev/null 2>&1 && ok "$c" || bad "$c 缺失"
+done
+
+echo
+echo "── 4. 网络 ──"
+ip -4 -br addr show wlan0 2>/dev/null | grep -q UP && \
+    ok "wlan0 $(ip -4 -br addr show wlan0 | awk '{print $3}')" || warn "wlan0 未启用"
+ip -4 -br addr show end0 2>/dev/null | grep -q UP && \
+    ok "end0 $(ip -4 -br addr show end0 | awk '{print $3}')" || true
+systemctl is-active --quiet NetworkManager && ok "NetworkManager 运行中" || bad "NetworkManager 未运行"
+
+echo
+echo "── 5. 服务 ──"
+for s in sshd tailscaled kmsconvt@tty1 seatd; do
+    systemctl is-active --quiet "$s" && ok "$s" || warn "$s 未运行"
+done
+
+echo
+echo "── 6. locale ──"
+if [ -f /usr/lib/locale/locale-archive ]; then
+    ok "locale-archive $(stat -c%s /usr/lib/locale/locale-archive) 字节"
+else
+    warn "locale-archive 缺失（跑 locale-gen 重建）"
+fi
+case "$(LANG=en_US.UTF-8 locale 2>&1 | grep LC_CTYPE)" in
+    *UTF-8*) ok "UTF-8 locale 可用" ;;
+    *)       warn "UTF-8 locale 不可用" ;;
+esac
+
+echo
+echo "── 7. 温度与风扇 ──"
+T=$(awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+PWM=$(cat /sys/class/hwmon/hwmon2/pwm1 2>/dev/null || echo "?")
+if [ -n "${T:-}" ]; then
+    TA=${T%.*}
+    if [ "$TA" -lt 55 ] 2>/dev/null; then ok "温度 ${T}°C（风扇 ${PWM}/255）"
+    elif [ "$TA" -lt 70 ] 2>/dev/null; then warn "温度 ${T}°C（偏高）"
+    else bad "温度 ${T}°C（过热！）"; fi
+fi
+
+if [ "${1:-}" = "--full" ]; then
+    echo
+    echo "── 8. 全量校验和（pacman -Qkk，耗时较长）──"
+    echo "${DIM}  检查中...${RST}"
+    pacman -Qkk > /tmp/qkk-check.txt 2>&1
+    REAL=$(grep -E "(SHA256 checksum mismatch|Size mismatch)" /tmp/qkk-check.txt 2>/dev/null | \
+           grep -v "^backup file" | wc -l)
+    if [ "$REAL" -eq 0 ]; then
+        ok "无内容损坏"
+    else
+        bad "$REAL 个文件内容损坏，详见 /tmp/qkk-check.txt"
+        grep -E "(SHA256 checksum mismatch|Size mismatch)" /tmp/qkk-check.txt 2>/dev/null | \
+            grep -v "^backup file" | head -10 | sed "s/^warning: //; s/^/      /"
+    fi
+else
+    echo
+    echo "${DIM}  提示: 用 pt35-healthcheck --full 做全量校验和检查${RST}"
+fi
+
+echo
+echo "══════════════════════════════════════"
+if [ "$ISSUES" -eq 0 ]; then
+    printf "${GRN}  ✅ 全部正常${RST}\n"
+else
+    printf "${YEL}  ⚠️  %d 项需要注意${RST}\n" "$ISSUES"
+fi
+echo
+echo "${DIM}  记住：关机后用 pt35-poweroff，等绿灯停再双击顶部键断电${RST}"

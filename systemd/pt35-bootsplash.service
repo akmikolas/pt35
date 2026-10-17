@@ -1,0 +1,24 @@
+[Unit]
+Description=PocketTerm35 CRT-glitch boot animation
+Documentation=file:/usr/local/bin/pt35-bootsplash
+DefaultDependencies=no
+After=systemd-udev-settle.service local-fs.target
+Before=kmsconvt@tty1.service getty@tty1.service pt35-desktop.service
+Conflicts=kmsconvt@tty1.service
+ConditionPathExists=!/etc/pt35-no-bootsplash
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pt35-bootsplash
+TTYPath=/dev/tty1
+StandardOutput=tty
+StandardError=journal
+Restart=no
+TimeoutStopSec=15
+# ★ Async restore again: at this point the compositor still holds DRM master,
+#   so a synchronous `systemctl start kmsconvt@tty1` would fail and block until
+#   the unit times out ("State 'stop-post' timed out").
+ExecStopPost=-systemd-run --collect --quiet --unit=pt35-boot-rescue /bin/sh -c 'for i in $(seq 1 20); do systemctl is-active --quiet pt35-desktop.service && break; sleep 1; done; for j in 1 2 3 4 5 6; do systemctl start kmsconvt@tty1 2>/dev/null; systemctl is-active --quiet kmsconvt@tty1 && break; sleep 2; done; chvt 1 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

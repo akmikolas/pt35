@@ -1,0 +1,76 @@
+#!/bin/bash
+# help: 桌面 | 切换输入法（zhime zh / en / toggle）
+# zhime —— 切换 fcitx5 输入法（中文/英文）
+#
+# 背景：Ctrl+Space 是标准切换键，但在掌机上有时想用命令直接切（或写进脚本）。
+#
+# 用法:
+#   zhime            显示当前输入法
+#   zhime en         切到英文
+#   zhime zh         切到中文（拼音）
+#   zhime toggle     在中英之间切换
+#
+# 注意：必须带正确的 Wayland/DBus 环境，否则 busctl 连不上 fcitx5。
+#       这也是之前"输入法没有候选框"的根因（fcitx5 缺 WAYLAND_DISPLAY）。
+set -u
+
+export HOME="${HOME:-/root}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+# 若在 SSH 下运行，需要补上 Wayland 显示名
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    _wd=$(ls "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\.lock$' | head -1)
+    [ -n "$_wd" ] && export WAYLAND_DISPLAY=$(basename "$_wd")
+fi
+
+CTL="org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1"
+
+if ! pgrep -x fcitx5 >/dev/null 2>&1; then
+    echo "fcitx5 未运行（中文桌面没启动？先执行 zhdesk）" >&2
+    exit 1
+fi
+
+current() {
+    busctl --user call $CTL CurrentInputMethod 2>/dev/null | sed 's/^s //; s/"//g'
+}
+
+case "${1:-show}" in
+    en|EN|english)
+        busctl --user call $CTL SetCurrentIM s "keyboard-us" >/dev/null 2>&1
+        sleep 1
+        echo "已切到英文: $(current)"
+        ;;
+    zh|ZH|chinese|pinyin)
+        busctl --user call $CTL SetCurrentIM s "pinyin" >/dev/null 2>&1
+        sleep 1
+        echo "已切到中文: $(current)"
+        ;;
+    toggle)
+        cur=$(current)
+        if [ "$cur" = "pinyin" ]; then
+            busctl --user call $CTL SetCurrentIM s "keyboard-us" >/dev/null 2>&1
+        else
+            busctl --user call $CTL SetCurrentIM s "pinyin" >/dev/null 2>&1
+        fi
+        sleep 1
+        echo "已切换: $(current)"
+        ;;
+    show|"")
+        cur=$(current)
+        state=$(busctl --user call $CTL State 2>/dev/null | sed 's/^i //')
+        echo "当前输入法: ${cur:-（空，fcitx5 未接入合成器！）}"
+        echo "启用状态:   $state  （0=未启用 1=启用）"
+        if [ -z "$cur" ] || [ "$state" = "0" ]; then
+            echo
+            echo "⚠️  fcitx5 没接入合成器。检查:"
+            pid=$(pgrep -x fcitx5 | head -1)
+            echo "   它的 WAYLAND_DISPLAY = $(tr '\0' '\n' < /proc/$pid/environ 2>/dev/null | grep ^WAYLAND_DISPLAY= | cut -d= -f2 || echo 缺失)"
+            echo "   修复: 退出桌面后重跑 zhdesk（它会等 socket 就绪再启动 fcitx5）"
+        fi
+        ;;
+    *)
+        echo "用法: zhime [show|en|zh|toggle]" >&2
+        exit 1
+        ;;
+esac

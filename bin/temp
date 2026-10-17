@@ -1,0 +1,45 @@
+#!/bin/bash
+# help: 系统 | 温度与风扇状态
+# temp —— PocketTerm35 温度与风扇状态（手持散热用）
+# 用法: temp          看一次
+#       temp -w       持续监视（2 秒刷新，Ctrl-C 退出）
+#       temp -t       顺带看当前 CPU 频率与负载
+
+H=/sys/class/hwmon/hwmon2
+Z=/sys/class/thermal/thermal_zone0
+P=/sys/devices/system/cpu/cpufreq/policy0
+
+read_t() { awk '{printf "%.1f", $1/1000}' "$Z/temp" 2>/dev/null; }
+read_pwm() { cat "$H/pwm1" 2>/dev/null || echo 0; }
+read_st() { cat /sys/class/thermal/cooling_device0/cur_state 2>/dev/null || echo 0; }
+read_fr() { awk '{printf "%.0f", $1/1000}' "$P/scaling_cur_freq" 2>/dev/null; }
+
+# 温度着色：<45 绿，45-52 黄，>52 红
+color() {
+  local t=${1%.*}
+  if   [ "$t" -lt 45 ] 2>/dev/null; then printf '\033[32m'
+  elif [ "$t" -lt 52 ] 2>/dev/null; then printf '\033[33m'
+  else printf '\033[31m'; fi
+}
+
+line() {
+  local t p st fr bar n i
+  t=$(read_t); p=$(read_pwm); st=$(read_st); fr=$(read_fr)
+  # 风扇进度条（20 格）
+  n=$(( p * 20 / 255 )); bar=""
+  for ((i=0; i<20; i++)); do [ $i -lt $n ] && bar+="█" || bar+="░"; done
+  printf '  %s%5s°C\033[0m  ' "$(color "$t")" "$t"
+  printf '风扇 %s %3s%%  档%s' "$bar" "$(( p * 100 / 255 ))" "$st"
+  [ "${1:-}" = "-t" ] && printf '  CPU %s MHz  负载 %s' "$fr" "$(cut -d' ' -f1 /proc/loadavg)"
+  printf '\n'
+}
+
+if [ "${1:-}" = "-w" ]; then
+  echo "持续监视（Ctrl-C 退出）—— 目标 <50°C"
+  while :; do
+    printf '\r\033[K'; line -t
+    sleep 2
+  done
+else
+  line "${1:-}"
+fi

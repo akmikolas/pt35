@@ -1,0 +1,10 @@
+#!/bin/bash
+# help: 系统 | 出门前状态自检
+# PocketTerm35 出门前状态自检
+printf "  kmscon:   %s (%s) 字体 %s\n" "$(systemctl is-active kmsconvt@tty1)" "$(systemctl is-enabled kmsconvt@tty1)" "$(journalctl -u kmsconvt@tty1 -n 20 --no-pager 2>/dev/null | grep -oE "cell size [0-9]+x[0-9]+" | tail -1)"
+printf "  locale:   %s\n" "$(grep -oP "(?<=^LANG=).*" /etc/locale.conf)"
+printf "  网络:     %s (%s)\n" "$(ip -4 -br addr show wlan0 | awk "{print \$3}")" "$(nmcli -t -f GENERAL.CONNECTION dev show wlan0 | cut -d: -f2)"
+printf "  Tailscale: %s %s\n" "$(tailscale status --json 2>/dev/null | jq -r .BackendState)" "$(tailscale ip -4 2>/dev/null)"
+printf "  xray代理: %s %s\n" "$(systemctl is-active xray-knife-proxy)" "$(ss -ltn 2>/dev/null | grep -q 9999 && echo 监听中)"
+printf "  opencode: %s  模型 %s\n" "$(opencode --version 2>&1 | head -1 | awk "{print \$2}")" "$(opencode models 2>/dev/null | grep cffan | head -1)"
+printf "  磁盘:     %s\n" "$(df -h / | tail -1 | awk "{print \$3\"/\"\$2\" (\"\$5\")\"}")"

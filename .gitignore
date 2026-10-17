@@ -1,0 +1,49 @@
+# ── 机密（绝对不能进仓库）──────────────────────────────────
+.env
+.env.*
+*.env
+secrets/
+.secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+/root/
+nm-backup-*.nmconnection
+
+# ── 本地配置（由 pt35.conf.example 派生）────────────────────
+pt35.conf
+local.conf
+
+# ── 设备实例数据 ───────────────────────────────────────────
+xray-knife.db
+xray-knife.db-*
+valid.txt
+configs.txt
+opencode.json
+
+# ── 构建/运行产物 ──────────────────────────────────────────
+*.log
+*.bak
+*.tmp
+*.orig
+*.rej
+*~
+.cache/
+__pycache__/
+*.pyc
+
+# ── 编辑器 / 系统 ──────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── 大文件 / 二进制（按需）─────────────────────────────────
+*.img
+*.img.zst
+*.zip
+*.tar.gz
+*.tgz

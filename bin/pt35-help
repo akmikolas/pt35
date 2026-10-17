@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+# help: 工具 | 查看所有自定义命令的帮助
+"""pt35-help —— PocketTerm35 自定义命令的集中帮助
+
+设计思路：
+  * **自动发现**：扫描 /usr/local/bin，不需要维护一张命令清单表
+  * **元数据来自脚本自身**：每个脚本头部有一行
+        # help: <分类> | <一句话说明>
+    这样说明永远和代码在一起，不会过期
+  * **用法自动提取**：从脚本里的 `用法:` / `USAGE:` 注释抓取
+
+用法:
+  pt35-help                 按分类列出全部命令
+  pt35-help <命令>          查看某个命令的详细帮助（含用法）
+  pt35-help <关键词>        搜索命令（匹配名字或说明）
+  pt35-help --all           列出全部（含未分类/无说明的）
+  pt35-help --raw           纯文本输出（便于管道/less）
+"""
+import os
+import re
+import subprocess
+import sys
+
+BIN_DIRS = ['/usr/local/bin', '/usr/local/sbin']
+SELF = {'pt35-help'}
+
+CAT_ORDER = ['桌面', '显示', '网络', '系统', '电源', '工具', '其他']
+CAT_ALIAS = {'desktop': '桌面', 'display': '显示', 'net': '网络',
+             'network': '网络', 'sys': '系统', 'power': '电源',
+             'tool': '工具', 'misc': '其他'}
+
+E = '\033'
+R = E + '[0m'
+BOLD = E + '[1m'
+DIM = E + '[2m'
+CYAN = E + '[36m'
+GREEN = E + '[32m'
+YELLOW = E + '[33m'
+RED = E + '[31m'
+
+
+def read_head(path, nbytes=8192):
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read(nbytes)
+        return raw.decode('utf-8', 'replace')
+    except OSError:
+        return ''
+
+
+def parse_meta(path):
+    """从脚本头部提取 help 元数据"""
+    head = read_head(path)
+    cat, desc = '其他', ''
+    m = re.search(r'^#\s*help:\s*(.+)$', head, re.M)
+    if m:
+        raw = m.group(1).strip()
+        if '|' in raw:
+            c, d = raw.split('|', 1)
+            c = c.strip()
+            cat = CAT_ALIAS.get(c.lower(), c) or '其他'
+            desc = d.strip()
+        else:
+            desc = raw
+    if not desc:
+        # 回退：取文件名后的第一行说明性注释
+        for ln in head.split('\n')[:12]:
+            t = ln.strip()
+            if t.startswith('#') and not t.startswith('#!'):
+                t = t.lstrip('#').strip()
+                if t and not t.startswith('-') and 'help:' not in t:
+                    desc = t
+                    break
+    return cat, desc
+
+
+def parse_usage(path):
+    """提取用法行（优先从内建 --help 文本，其次从头部注释）"""
+    # ① 先从内建 --help heredoc 里找「用法:」段
+    ht = extract_help_heredoc(path)
+    if ht:
+        lines = ht.split('\n')
+        out = []
+        grab = False
+        for ln in lines:
+            st = ln.strip()
+            if re.match(r'^(用法|USAGE|Usage)\s*:?\s*$', st):
+                grab = True
+                continue
+            if grab:
+                if not st:
+                    if out:
+                        break
+                    continue
+                if re.match(r'^[\u4e00-\u9fff]{2,}[:：]\s*$', st) and out:
+                    break
+                out.append(st)
+                if len(out) > 20:
+                    break
+            elif re.match(r'^(用法|USAGE|Usage)\s*:', st):
+                out.append(re.sub(r'^(用法|USAGE|Usage)\s*:\s*', '', st))
+                grab = True
+        if out:
+            return out
+    # ② 回退：从头部注释里找
+    head = read_head(path, 16384)
+    lines = head.split('\n')
+    out = []
+    grab = False
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if re.match(r'^#\s*(用法|USAGE|Usage|用法:)\s*:?', s):
+            grab = True
+            body = re.sub(r'^#\s*(用法|USAGE|Usage)\s*:?\s*', '', s)
+            if body:
+                out.append(body)
+            continue
+        if grab:
+            if s.startswith('#'):
+                body = s.lstrip('#').strip()
+                if not body or re.match(r'^(用法|USAGE|用\s*法)', body):
+                    if not body:
+                        break
+                    continue
+                out.append(body)
+                if len(out) > 24:
+                    break
+            else:
+                break
+    # 顺带抓 --help 里可能的子命令参数
+    return out
+
+
+def list_commands(include_all=False):
+    cmds = {}
+    for d in BIN_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            if name in SELF:
+                continue
+            p = os.path.join(d, name)
+            if not os.path.isfile(p) or not os.access(p, os.X_OK):
+                continue
+            head = read_head(p, 4)
+            if not head.startswith('#!'):
+                # 二进制（如 xray-knife）—— 只列知名的
+                if name not in ('xray-knife',):
+                    continue
+            cat, desc = parse_meta(p)
+            if not desc and not include_all:
+                continue
+            cmds[name] = {'cat': cat, 'desc': desc, 'path': p}
+    return cmds
+
+
+def show_list(cmds, raw=False):
+    if raw:
+        print('PocketTerm35 自定义命令')
+        print('=' * 60)
+        for cat in CAT_ORDER:
+            items = [(k, v) for k, v in sorted(cmds.items()) if v['cat'] == cat]
+            if not items:
+                continue
+            print(f'\n[{cat}]')
+            for k, v in items:
+                print(f'  {k:<22} {v["desc"]}')
+        print('\n详细帮助: pt35-help <命令>    搜索: pt35-help <关键词>')
+        return
+    print(f'{BOLD}PocketTerm35 自定义命令{R}')
+    print(f'{DIM}{"─" * 68}{R}')
+    shown = 0
+    for cat in CAT_ORDER:
+        items = [(k, v) for k, v in sorted(cmds.items()) if v['cat'] == cat]
+        if not items:
+            continue
+        print(f'\n{CYAN}▍{cat}{R}')
+        for k, v in items:
+            print(f'   {GREEN}{k:<22}{R} {v["desc"]}')
+            shown += 1
+    print("\n" + DIM + "─"*68 + R)
+    print(f'  {BOLD}pt35-help <命令>{R}     查看详细用法')
+    print(f'  {BOLD}pt35-help <关键词>{R}   搜索命令')
+    print(f'  {DIM}共 {shown} 个命令{R}')
+
+
+def show_detail(name, cmds):
+    if name not in cmds:
+        # 模糊匹配
+        cand = [k for k in cmds if name in k]
+        if len(cand) == 1:
+            name = cand[0]
+        elif cand:
+            print(YELLOW + "找到多个匹配: " + R + ", ".join(cand))
+            return 1
+        else:
+            print(RED + "未找到命令: " + R + name)
+            print(DIM + "用 pt35-help 查看全部" + R)
+            return 1
+    v = cmds[name]
+    print(f'{BOLD}{name}{R}   {DIM}[{v["cat"]}]{R}')
+    print(f'  {v["desc"]}')
+    print(f'  {DIM}路径: {v["path"]}{R}')
+    usage = parse_usage(v['path'])
+    if usage:
+        print(f'\n{BOLD}用法{R}')
+        for u in usage:
+            print(f'  {u}')
+    else:
+        print(f'\n{DIM}（脚本里没有写用法说明）{R}')
+    # ★ 安全设计：**绝不执行脚本**。
+    # 起因：`pt35-help pt35-poweroff` 曾经真的把机器关掉了 —— 因为
+    # 早期实现会跑 `<命令> --help`，而 pt35-poweroff 当时不检查参数。
+    # 现在改为纯源码解析：从脚本里找到 `--help` 分支的 heredoc 文本。
+    help_text = extract_help_heredoc(v['path'])
+    if help_text:
+        print(f'\n{BOLD}脚本内建帮助{R}')
+        for ln in help_text.split('\n')[:40]:
+            print(f'  {ln}')
+    elif name not in ('pt35-help',):
+        print(f'\n{DIM}（该脚本无内建 --help 文本）{R}')
+    return 0
+
+
+def extract_help_heredoc(path):
+    """从脚本源码里提取 --help 分支的 heredoc 内容（不执行脚本）"""
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read(65536)
+        src = raw.decode('utf-8', 'replace')
+    except OSError:
+        return None
+    # 找 <<'TAG' ... TAG 形式（TAG 常为 USAGE / EOF / HELP）
+    m = re.search(
+        r"--help.*?<<\s*['\"]?(\w+)['\"]?\s*\n(.*?)\n\s*\1\s*$",
+        src, re.S | re.M)
+    if not m:
+        # Python 脚本可能是 print(__doc__) —— 取模块 docstring
+        m2 = re.search(r'^"""(.+?)"""', src, re.S | re.M)
+        if m2:
+            return m2.group(1).strip()
+        return None
+    return m.group(2).rstrip()
+
+
+
+
+
+def search(kw, cmds):
+    kw_l = kw.lower()
+    # 搜索范围：命令名 + 说明 + **分类**
+    # （之前不匹配分类，导致 "pt35 网络" 搜不到 wifi —— 实测踩到）
+    hits = [(k, v) for k, v in sorted(cmds.items())
+            if kw_l in k.lower()
+            or kw_l in v['desc'].lower()
+            or kw_l in v['cat'].lower()]
+    if not hits:
+        print(YELLOW + "没有匹配 " + kw + " 的命令" + R)
+        return 1
+    print(BOLD + "匹配 " + kw + " 的命令（" + str(len(hits)) + " 个）" + R)
+    for k, v in hits:
+        print(f'  {GREEN}{k:<22}{R} {v["desc"]}  {DIM}[{v["cat"]}]{R}')
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    raw = '--raw' in args
+    args = [a for a in args if a not in ('--raw',)]
+    cmds = list_commands(include_all='--all' in args or raw)
+    args = [a for a in args if a != '--all']
+
+    if not args:
+        show_list(cmds, raw)
+        return 0
+    if len(args) == 1:
+        name = args[0]
+        if name in cmds:
+            return show_detail(name, cmds)
+        return search(name, cmds)
+    print(__doc__)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

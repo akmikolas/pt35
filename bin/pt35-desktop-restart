@@ -1,0 +1,44 @@
+#!/bin/bash
+# help: 桌面 | 安全重启桌面（绕开 systemd restart 的竞态）
+#
+# 用法:
+#   pt35-desktop-restart        安全重启：stop → 等干净 → start
+#   pt35-desktop-restart -h     显示本帮助
+#
+# ★ 为什么不用 systemctl restart：
+#   实测 restart 会在【同一秒】内 start 和 stop，zhdesk 的 `wait $SWAY_PID`
+#   会阻塞到 TimeoutStopSec 超时，然后整个 cgroup 被 SIGKILL，
+#   导致 seat/DRM 状态不干净、下次启动失败。
+#   改用 stop → 等 sway 完全消失 → 清残留 socket → start，稳定可靠。
+set -u
+case "${1:-}" in -h|--help) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0 ;; esac
+
+echo "① 停止桌面..."
+systemctl stop pt35-desktop 2>/dev/null
+for i in $(seq 1 40); do
+    systemctl is-active --quiet pt35-desktop 2>/dev/null || break
+    sleep 1
+done
+echo "   ✓ 已停止（耗时 ${i}s）"
+
+echo "② 清理残留进程与 socket..."
+for p in sway swaybg foot fcitx5; do pkill -x "$p" 2>/dev/null; done
+sleep 3
+rm -f /run/pt35/wayland-* /run/pt35/sway-ipc.* 2>/dev/null
+systemctl reset-failed pt35-desktop 2>/dev/null
+echo "   ✓ 已清理"
+
+echo "③ 启动桌面..."
+systemctl start pt35-desktop
+for i in $(seq 1 45); do
+    [ -n "$(ls /run/pt35/wayland-* 2>/dev/null | grep -v lock)" ] && break
+    sleep 1
+done
+sleep 6
+if [ "$(systemctl is-active pt35-desktop 2>/dev/null)" = "active" ]; then
+    echo "   ✅ 桌面已就绪（sway=$(pgrep -c sway) foot=$(pgrep -c foot) fcitx5=$(pgrep -c fcitx5)）"
+    echo "   按 Ctrl+Alt+F2 切换过去"
+else
+    echo "   ❌ 启动失败，看日志: tail -30 /tmp/zhdesk.log"
+    exit 1
+fi

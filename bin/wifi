@@ -1,0 +1,173 @@
+#!/bin/bash
+# help: 网络 | WiFi 管理（扫描/连接/状态）
+# wifi —— PocketTerm35 的 WiFi 管理（NetworkManager 后端）
+#
+# 架构说明（这是最终统一后的状态）：
+#   本机网络**完全由 NetworkManager 管理**（wlan0 由 NM 接管，静态 IP 走 NM 档案）。
+#   systemd-networkd 与独立的 wpa_supplicant@wlan0 已停用，
+#   避免"两套网络栈抢同一张网卡"的冲突（这个冲突让我掉线过 4 次）。
+#   NM 会自己拉起所需的 wpa_supplicant 实例，无需手动。
+#
+# 因此这里用 nmcli —— 现在它真的能用。
+#
+# 用法:
+#   wifi                交互式：扫描 → 选编号 → 输密码 → 连接
+#   wifi list           列出可见网络
+#   wifi status         当前 IP / SSID / 信号 / 连接名
+#   wifi saved          已保存的连接档案
+#   wifi static         把当前连接设为静态（见 /etc/pt35.conf）
+#   wifi dhcp           把当前连接设为 DHCP
+#   wifi forget <名称>   删除连接档案
+set -u
+
+GRE=$'\033[32m'; RED=$'\033[31m'; YEL=$'\033[33m'; DIM=$'\033[2m'; BLD=$'\033[1m'; RST=$'\033[0m'
+IF=wlan0
+# ── 静态网络配置（可覆盖）─────────────────────────────────
+# 优先级：环境变量 > /etc/pt35.conf > 内置默认值
+# 用法示例：
+#   STATIC_IP=10.0.0.50/24 STATIC_GW=10.0.0.1 wifi static
+# 或在 /etc/pt35.conf 里写：
+#   STATIC_IP=192.168.1.100/24
+#   STATIC_GW=192.168.1.1
+#   DNS_LIST="223.5.5.5 1.1.1.1"
+[ -r /etc/pt35.conf ] && . /etc/pt35.conf
+: "${STATIC_IP:=192.168.1.100/24}"
+: "${STATIC_GW:=192.168.1.1}"
+: "${DNS_LIST:=223.5.5.5 1.1.1.1}"
+
+need_root() { [ "$(id -u)" = 0 ] || { echo "${RED}需要 root：sudo $0 $*${RST}" >&2; exit 1; }; }
+cur_ip()   { ip -4 -br addr show "$IF" 2>/dev/null | awk '{print $3}'; }
+cur_ssid() { nmcli -t -f GENERAL.CONNECTION dev show "$IF" 2>/dev/null | cut -d: -f2; }
+cur_sig()  { iw dev "$IF" link 2>/dev/null | awk -F': ' '/signal:/{print $2}'; }
+
+scan_networks() {
+  # 输出 "信号|SSID"（强→弱，去重，剔除隐藏网络）
+  nmcli -t -f SSID,SIGNAL dev wifi list ifname "$IF" --rescan yes 2>/dev/null \
+    | awk -F: 'NF>=2 && $1 != "" && $1 != "--" { print $2 "|" $1 }' \
+    | sort -t'|' -k1 -rn | awk -F'|' '!seen[$2]++'
+}
+
+bars_for() {
+  local s="$1"
+  if   [ "$s" -ge 75 ] 2>/dev/null; then printf '▂▄▆█'
+  elif [ "$s" -ge 50 ] 2>/dev/null; then printf '▂▄▆_'
+  elif [ "$s" -ge 30 ] 2>/dev/null; then printf '▂▄__'
+  else printf '____'; fi
+}
+
+show_list() {
+  local i=0 sig ssid
+  while IFS='|' read -r sig ssid; do
+    [ -z "${ssid:-}" ] && continue
+    i=$((i + 1))
+    printf '  %s%2d)%s %-30s %s %s%%\n' "$BLD" "$i" "$RST" "$ssid" "$(bars_for "$sig")" "$sig"
+  done
+}
+
+wait_ip() {
+  local n="${1:-40}" i=0
+  while [ "$i" -lt "$n" ]; do
+    sleep 2; i=$((i + 2))
+    if [ -n "$(cur_ip)" ] && ip route | grep -q '^default'; then return 0; fi
+  done
+  return 1
+}
+
+case "${1:-}" in
+  list)
+    need_root "$@"
+    echo "${DIM}扫描中...${RST}"
+    scan_networks | show_list
+    ;;
+
+  status)
+    printf '%s=== wlan0 ===%s\n' "$BLD" "$RST"
+    printf '  IP:      %s\n' "$(cur_ip)"
+    printf '  连接:    %s\n' "$(cur_ssid)"
+    printf '  信号:    %s\n' "$(cur_sig)"
+    printf '  MAC:     %s\n' "$(cat /sys/class/net/$IF/address 2>/dev/null)"
+    printf '  IP 方式: %s\n' "$(nmcli -t -f ipv4.method connection show "$(cur_ssid)" 2>/dev/null | cut -d: -f2 | sed 's/manual/静态/;s/auto/DHCP/')"
+    printf '  默认路由: %s\n' "$(ip route | grep default | head -1 | cut -d' ' -f1-3)"
+    ;;
+
+  saved)
+    need_root "$@"
+    echo "${BLD}已保存的连接:${RST}"
+    nmcli -t -f NAME,TYPE,AUTOCONNECT connection show 2>/dev/null \
+      | awk -F: '$2 ~ /wireless/ { printf "  - %s (自动连接: %s)\n", $1, ($3=="yes"?"是":"否") }'
+    ;;
+
+  static)
+    need_root "$@"
+    C="$(cur_ssid)"
+    [ -n "$C" ] || { echo "${RED}当前没有活动连接${RST}"; exit 1; }
+    nmcli connection modify "$C" ipv4.method manual \
+      ipv4.addresses "$STATIC_IP" ipv4.gateway "$STATIC_GW" ipv4.dns "$DNS_LIST" 2>&1 | sed 's/^/  /'
+    echo "  ${GRE}已设为静态 $STATIC_IP${RST}，正在激活..."
+    nmcli connection up "$C" >/dev/null 2>&1
+    wait_ip 40 && echo "  ${GRE}✅ $(cur_ip)${RST}" || echo "  ${RED}未获得 IP${RST}"
+    ;;
+
+  dhcp)
+    need_root "$@"
+    C="$(cur_ssid)"
+    [ -n "$C" ] || { echo "${RED}当前没有活动连接${RST}"; exit 1; }
+    nmcli connection modify "$C" ipv4.method auto ipv4.addresses "" ipv4.gateway "" 2>&1 | sed 's/^/  /'
+    echo "  ${GRE}已设为 DHCP${RST}，正在激活..."
+    nmcli connection up "$C" >/dev/null 2>&1
+    wait_ip 40 && echo "  ${GRE}✅ $(cur_ip)${RST}" || echo "  ${RED}未获得 IP${RST}"
+    ;;
+
+  forget)
+    need_root "$@"; shift
+    [ $# -ge 1 ] || { echo "用法: wifi forget <连接名>"; exit 1; }
+    nmcli connection delete "$1" && echo "  ${GRE}✅ 已删除: $1${RST}"
+    ;;
+
+  *)
+    need_root "$@"
+    OLD="$(cur_ssid)"
+    printf '%s=== PocketTerm35 WiFi ===%s\n' "$BLD" "$RST"
+    printf '  当前: %s   IP: %s\n' "${OLD:-未连接}" "$(cur_ip)"
+    echo
+    echo "${DIM}扫描中...${RST}"
+    mapfile -t NETS < <(scan_networks)
+    if [ "${#NETS[@]}" -eq 0 ]; then
+      echo "${RED}未扫到网络${RST}；检查: nmcli dev wifi list ifname $IF"
+      exit 1
+    fi
+    printf '%s\n' "${NETS[@]}" | show_list
+    echo
+    printf '  %s0)%s 重新扫描    %sq)%s 退出\n' "$BLD" "$RST" "$BLD" "$RST"
+    read -rp "  选择编号: " N
+    case "$N" in ''|q|Q) exit 0 ;; 0) exec "$0" ;; esac
+    ENTRY="$(printf '%s\n' "${NETS[@]}" | sed -n "${N}p")"
+    SSID="${ENTRY#*|}"
+    if [ -z "$SSID" ] || [ "$SSID" = "$ENTRY" ]; then echo "${RED}无效选择${RST}"; exit 1; fi
+    echo "  已选: ${GRE}${SSID}${RST}"
+
+    # 已有档案就直接启用
+    if nmcli -t -f NAME connection show 2>/dev/null | grep -qxF "$SSID"; then
+      echo "  ${YEL}已有保存的档案，直接启用${RST}"
+      nmcli connection up "$SSID" ifname "$IF" 2>&1 | sed 's/^/  /'
+    else
+      read -rsp "  密码（开放网络直接回车）: " PSK; echo
+      echo "${DIM}连接中...${RST}"
+      if [ -z "$PSK" ]; then
+        nmcli device wifi connect "$SSID" ifname "$IF" 2>&1 | sed 's/^/  /'
+      else
+        nmcli device wifi connect "$SSID" password "$PSK" ifname "$IF" 2>&1 | sed 's/^/  /'
+      fi
+    fi
+    echo
+    if wait_ip 40; then
+      echo "  ${GRE}✅ 已连接: $(cur_ssid)   IP $(cur_ip)${RST}"
+      if ! ip route | grep -q '192.168.1.1 dev'; then
+        echo "  ${DIM}提示: 若原为静态 IP，换网络后请用 'wifi dhcp' 或 'wifi static' 调整${RST}"
+      fi
+    else
+      echo "  ${RED}❌ 未获得 IP${RST}"
+      echo "  ${DIM}检查密码是否正确；或 nmcli connection show '$SSID' 看详情${RST}"
+    fi
+    ;;
+esac

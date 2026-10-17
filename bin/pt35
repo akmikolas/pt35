@@ -1,0 +1,26 @@
+#!/bin/bash
+# help: 工具 | PocketTerm35 命令入口（无参数=列出全部命令）
+#
+# 用法:
+#   pt35               列出所有自定义命令
+#   pt35 <命令> [参数]  直接执行该命令（等价于直接敲命令名）
+#   pt35 <关键词>       搜索命令
+#   pt35 --all          列出全部（含无说明的脚本）
+#
+# 这是 pt35-help 的便捷入口：让"忘记命令名"时有个统一入口。
+# 做成独立可执行文件（而不是 .bashrc 里的函数），
+# 因为登录 shell 不读 .bashrc，脚本形式在任何 shell 里都能用。
+set -u
+
+if [ $# -eq 0 ]; then
+    exec /usr/local/bin/pt35-help
+fi
+
+# 第一个参数是已知命令 → 直接执行（透传其余参数）
+if command -v "$1" >/dev/null 2>&1; then
+    CMD="$1"; shift
+    exec "$CMD" "$@"
+fi
+
+# 否则交给 pt35-help 搜索
+exec /usr/local/bin/pt35-help "$@"

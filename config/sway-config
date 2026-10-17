@@ -1,0 +1,82 @@
+# sway 配置 — PocketTerm35 极简中文桌面
+# 目标：全屏 foot 终端 + fcitx5 中文输入，无面板无壁纸，内存占用最小
+
+### 修饰键（sway 默认未定义 $mod，必须显式设置）
+set $mod Mod4
+
+### 输出与缩放（640x480 小屏）
+output * bg #000000 solid_color
+output * scale 1
+
+### 输入设备（RP2040 键盘 + Goodix 触摸）
+input "type:keyboard" {
+    xkb_layout us
+    repeat_delay 300
+    repeat_rate 35
+}
+input "type:touch" {
+    # 触摸屏映射到整个输出
+    map_to_output HDMI-A-1
+}
+# 让触摸模拟鼠标点击（Goodix 是单点触摸屏，sway 默认直接当触摸事件）
+seat seat0 fallback true
+
+### 外观（极简：无边框、无间隙，最大化终端空间）
+default_border none
+default_floating_border none
+gaps inner 0
+gaps outer 0
+font pango:Terminus 10
+
+### 按键绑定
+# 启动终端（主力：foot，支持 fcitx5 的 text-input 协议）
+set $term foot
+
+# 启动器
+bindsym $mod+Return exec $term
+# 关闭窗口
+bindsym $mod+Shift+q kill
+# 退出 sway
+bindsym $mod+Shift+e exit
+# 重新加载配置
+bindsym $mod+Shift+c reload
+
+# 切换窗口
+bindsym $mod+Left focus left
+bindsym $mod+Right focus right
+bindsym $mod+Up focus up
+bindsym $mod+Down focus down
+
+# 移动窗口
+bindsym $mod+Shift+Left move left
+bindsym $mod+Shift+Right move right
+
+# 工作区
+bindsym $mod+1 workspace number 1
+bindsym $mod+2 workspace number 2
+bindsym $mod+Shift+1 move container to workspace number 1
+bindsym $mod+Shift+2 move container to workspace number 2
+
+# 布局
+bindsym $mod+b splith
+bindsym $mod+v splitv
+bindsym $mod+f fullscreen toggle
+bindsym $mod+Shift+space floating toggle
+
+# 音量（如有需要，用 amixer）
+bindsym XF86AudioRaiseVolume exec amixer set Master 5%+ 2>/dev/null
+bindsym XF86AudioLowerVolume exec amixer set Master 5%- 2>/dev/null
+bindsym XF86AudioMute exec amixer set Master toggle 2>/dev/null
+
+# 亮度（若支持）
+bindsym XF86MonBrightnessUp exec brightnessctl set +10% 2>/dev/null
+bindsym XF86MonBrightnessDown exec brightnessctl set 10%- 2>/dev/null
+
+### X11 支持（若装了 xorg-xwayland）
+xwayland enable
+
+### 自动启动
+# fcitx5 由 zhdesk 负责启动（必须在 wayland socket 就绪后，否则连不上合成器）
+# 这里不启动，避免环境不正确导致输入法失效
+# 启动后立刻开一个终端（占据整屏，这就是"桌面"）
+exec $term
