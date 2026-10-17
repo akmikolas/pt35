@@ -1,0 +1,337 @@
+#!/bin/bash
+# help: 桌面 | 切换终端背景（预设配色 / 自定义颜色 / 壁纸+透明）
+#
+# 用法:
+#   pt35-bg                     显示当前设置
+#   pt35-bg list                列出所有预设
+#   pt35-bg <预设>              套用预设（concrete/void/hiss/oceanview/amber）
+#   pt35-bg bg <颜色>           只改背景色（#1a1a1a 或 1a1a1a）
+#   pt35-bg fg <颜色>           只改前景色
+#   pt35-bg alpha <0.0-1.0>     设置终端透明度（1.0=不透明）
+#   pt35-bg blur <yes|no>       毛玻璃（需 alpha<1）
+#   pt35-bg image <图片路径>    设置壁纸（swaybg），并把终端调成半透明
+#   pt35-bg image none          去掉壁纸
+#   pt35-bg reload              让运行中的 foot 重新读配置
+#   pt35-bg -h|--help           显示本帮助
+#
+# 工作原理:
+#   * foot 是**全屏**的，所以你看到的是 foot 的背景，不是 sway 的。
+#     —— 改 sway 的 `output * bg` 只在终端没铺满时才可见。
+#   * 改完 foot.ini 后，用 SIGUSR1 让运行中的 foot 重载配置（不用重启桌面）。
+#   * 透明 + 壁纸：swaybg 画在 foot 下面，foot 半透明时透出来。
+#     640x480 小屏建议 alpha 不低于 0.75，否则文字可读性下降。
+#
+# 颜色格式: 6 位十六进制（# 可省略），例如 1a1a1a / #0a0a0a
+
+set -u
+
+FOOT_INI="${FOOT_INI:-/root/.config/foot/foot.ini}"
+SWAY_CONF="${SWAY_CONF:-/root/.config/sway/config}"
+STATE="${STATE:-/etc/pt35-bg.conf}"
+R='\033[0m'; B='\033[1;37m'; G='\033[32m'; Y='\033[33m'; RD='\033[31m'; D='\033[90m'
+ok()  { printf "  ${G}✓${R} %b\n" "$*"; }
+warn(){ printf "  ${Y}!${R} %b\n" "$*"; }
+err() { printf "  ${RD}✗${R} %b\n" "$*" >&2; }
+hdr() { printf "\n${B}%s${R}\n" "$*"; }
+
+case "${1:-}" in
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \?//'; exit 0 ;;
+esac
+
+# ── 预设 ──────────────────────────────────────────────────
+# 格式: 名称|背景|前景|红色|描述
+PRESETS='
+concrete|1a1a1a|d0d0d0|cc5555|水泥灰（默认）—— 中性冷灰混凝土
+void|000000|c8c8c8|e04a4a|深黑 —— 对比最强，省电
+hiss|14181a|c0c8c0|d04040|Hiss 绿调 —— 呼应"现实被侵蚀"
+oceanview|1a1d24|c8d0dc|cc5555|机构蓝灰 —— 最像 FBC 办公系统
+amber|1a1510|d8c8a8|d08040|琥珀终端 —— 老式 CRT 磷光
+paper|e8e6e0|2a2a2a|b03030|纸白 —— 反色，强光下可读
+'
+
+preset_get() {  # preset_get <名称> <字段号1-4>
+    printf '%s' "$PRESETS" | awk -F'|' -v n="$1" -v f="$2" '
+        $1==n {print $f; found=1} END{}' | head -1
+}
+preset_exists() { printf '%s' "$PRESETS" | awk -F'|' -v n="$1" '$1==n{f=1} END{exit !f}'; }
+
+# ── 颜色规范化 ────────────────────────────────────────────
+norm_color() {  # 去掉 #，验证并展开为 6 位十六进制
+    local c="${1#\#}"
+    c=$(printf '%s' "$c" | tr 'A-F' 'a-f')
+    case "$c" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+            printf '%s' "$c" ;;
+        [0-9a-f][0-9a-f][0-9a-f])
+            # 3 位缩写：#f00 → ff0000（每字符重复，不是整体重复）
+            printf '%s%s%s%s%s%s' \
+                "${c:0:1}" "${c:0:1}" "${c:1:1}" "${c:1:1}" "${c:2:1}" "${c:2:1}" ;;
+        *) return 1 ;;
+    esac
+}
+
+# ── 改 foot.ini ───────────────────────────────────────────
+# 用 python 精确改（保留注释与其它段）
+edit_ini() {  # edit_ini <key> <value> [section]
+    # 段感知编辑：
+    #   * key 在该段里存在 → 原地改
+    #   * key 在该段里不存在 → 插到该段末尾（其它段的同名键不动）
+    # 这样 background / foreground 不会跑到主段，alpha / blur 也不会跑到文件尾。
+    python3 - "$FOOT_INI" "$1" "$2" "${3:-}" <<'PYEOF'
+import sys, re, pathlib
+path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+target = sys.argv[4] if len(sys.argv) > 4 else ""
+
+# 各键所属段（foot.ini 的实际结构）
+SECTION_OF = {
+    "background": "colors-dark", "foreground": "colors-dark",
+    "regular0": "colors-dark", "regular1": "colors-dark",
+    "regular2": "colors-dark", "regular3": "colors-dark",
+    "regular4": "colors-dark", "regular5": "colors-dark",
+    "regular6": "colors-dark", "regular7": "colors-dark",
+    "bright0": "colors-dark", "bright1": "colors-dark",
+    "bright2": "colors-dark", "bright3": "colors-dark",
+    "bright4": "colors-dark", "bright5": "colors-dark",
+    "bright6": "colors-dark", "bright7": "colors-dark",
+    "lines": "scrollback",
+    "style": "cursor", "blink": "cursor",
+    "hide-when-typing": "mouse",
+    "font-monospace-warn": "tweak",
+}
+if not target:
+    target = SECTION_OF.get(key, "")      # "" = 主段（无段名）
+
+p = pathlib.Path(path)
+lines = p.read_text(encoding="utf-8").split("\n")
+
+def sec_of(line):
+    st = line.strip()
+    if st.startswith("[") and st.endswith("]"):
+        return st[1:-1]
+    return None
+
+out = list(lines)
+
+# 主段 = 第一个 "[section]" 之前的行（foot.ini 的主段没有段名头）
+first_sec = next((i for i, l in enumerate(out) if sec_of(l) is not None), len(out))
+
+if target == "":
+    # ── 主段：只在 [第一个段] 之前查找/插入 ──
+    lo, hi = 0, first_sec
+else:
+    # ── 具名段：找它的行区间 ──
+    bounds, cur, start = {}, None, 0
+    for i, l in enumerate(out):
+        sname = sec_of(l)
+        if sname is not None:
+            if cur is not None:
+                bounds[cur] = (start, i)
+            cur, start = sname, i
+    if cur is not None:
+        bounds[cur] = (start, len(out))
+    lo, hi = bounds.get(target, (None, None))
+
+done = False
+if lo is not None:
+    for i in range(lo, hi):
+        if re.match(r"^\s*" + re.escape(key) + r"\s*=", out[i]):
+            out[i] = f"{key}={val}"; done = True; break
+    if not done:
+        j = hi
+        while j > lo and out[j-1].strip() == "":
+            j -= 1
+        out.insert(j, f"{key}={val}"); done = True
+else:
+    # 段不存在 → 在文件末尾新建（罕见路径）
+    out.append("")
+    if target:
+        out.append(f"[{target}]")
+    out.append(f"{key}={val}")
+
+# 清理连续空行
+clean, prev_blank = [], False
+for l in out:
+    blank = (l.strip() == "")
+    if blank and prev_blank:
+        continue
+    clean.append(l); prev_blank = blank
+
+p.write_text("\n".join(clean), encoding="utf-8")
+PYEOF
+}
+
+get_ini() {  # get_ini <key>
+    grep -m1 -E "^\s*$1\s*=" "$FOOT_INI" 2>/dev/null | sed -E "s/^\s*$1\s*=\s*//" | tr -d ' \r'
+}
+
+# ── 让运行中的 foot 重载 ──────────────────────────────────
+reload_foot() {
+    local n=0
+    for p in $(pgrep -x foot 2>/dev/null); do
+        kill -USR1 "$p" 2>/dev/null && n=$((n+1))
+    done
+    if [ "$n" -gt 0 ]; then
+        ok "已通知 $n 个 foot 重载配置"
+    else
+        warn "没有运行中的 foot（下次打开会生效）"
+    fi
+}
+
+# ── 应用颜色 ──────────────────────────────────────────────
+apply_colors() {  # apply_colors <bg> <fg> <red> [green] [blue]
+    local bg fg red green blue
+    bg=$(norm_color "$1") || { err "背景色无效: $1"; return 1; }
+    fg=$(norm_color "${2:-}") || fg=$(get_ini foreground)
+    red=$(norm_color "${3:-}") || red=$(printf '%s' "$(get_ini regular1)" | cut -c1-6)
+    green=$(norm_color "${4:-}") || green=$(printf '%s' "$(get_ini regular2)" | cut -c1-6)
+    blue=$(norm_color "${5:-}") || blue=$(printf '%s' "$(get_ini regular4)" | cut -c1-6)
+
+    edit_ini background "$bg"
+    edit_ini foreground "$fg"
+    edit_ini regular0   "$bg"        # regular0 = 黑，应与背景一致
+    edit_ini regular1   "$red"
+    [ -n "$green" ] && edit_ini regular2 "$green"
+    [ -n "$blue" ]  && edit_ini regular4 "$blue"
+    # bright0 作为"暗灰"，取背景的提亮
+    edit_ini bright0 "$(python3 -c "
+h='$bg'
+r,g,b=(int(h[i:i+2],16) for i in (0,2,4))
+r,g,b=min(r+0x38,255),min(g+0x38,255),min(b+0x38,255)
+print(f'{r:02x}{g:02x}{b:02x}')")"
+
+    ok "背景 #$bg  前景 #$fg  红 #$red"
+}
+
+save_state() {
+    { echo "# pt35-bg 状态（自动生成）"
+      echo "PREFIX_BG=$(get_ini background)"
+      echo "PREFIX_FG=$(get_ini foreground)"
+      echo "ALPHA=$(get_ini alpha)"
+      echo "IMAGE=$(get_ini image)"
+    } > "$STATE" 2>/dev/null && chmod 644 "$STATE" 2>/dev/null
+}
+
+# ── 主逻辑 ────────────────────────────────────────────────
+CMD="${1:-status}"; shift 2>/dev/null || true
+
+case "$CMD" in
+    status|'')
+        hdr "当前背景设置"
+        printf "  配置文件   %s\n" "$FOOT_INI"
+        [ -f "$FOOT_INI" ] || { err "foot.ini 不存在"; exit 1; }
+        BGV=$(get_ini background)
+        SW=$(python3 -c "
+h='$BGV'.lstrip('#')
+try: r,g,b=(int(h[i:i+2],16) for i in (0,2,4))
+except: r=g=b=0
+print(f'\033[48;2;{r};{g};{b}m    \033[0m')" 2>/dev/null)
+        printf "  背景色     %s ${B}#%s${R}\n" "$SW" "$BGV"
+        printf "  前景色     #%s\n" "$(get_ini foreground)"
+        printf "  红色       #%s\n" "$(get_ini regular1)"
+        A=$(get_ini alpha); printf "  透明度     %s\n" "${A:-1.0（不透明）}"
+        BL=$(get_ini blur); printf "  毛玻璃     %s\n" "${BL:-no}"
+        IM=$(get_ini image); printf "  壁纸       %s\n" "${IM:-无}"
+        echo
+        printf "  ${D}sway 底层背景: %s${R}\n" "$(grep -m1 'output \* bg' "$SWAY_CONF" 2>/dev/null | sed 's/output \* bg //' || echo '未设置')"
+        printf "  ${D}（foot 全屏时看不到 sway 背景）${R}\n"
+        echo
+        printf "  预设: %s\n" "$(printf '%s' "$PRESETS" | awk -F'|' 'NF>1{printf "%s ", $1}')"
+        printf "  ${D}用 pt35-bg list 看说明，pt35-bg <预设> 套用${R}\n"
+        ;;
+
+    list)
+        hdr "可用预设"
+        printf '%s' "$PRESETS" | python3 -c '
+import sys
+for line in sys.stdin:
+    f = line.strip().split("|")
+    if len(f) < 5: continue
+    name, bg, fg, red, desc = f[0], f[1], f[2], f[3], f[4]
+    def rgb(h):
+        h = h.lstrip("#")
+        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+    r, g, b = rgb(bg); fr, fg_, fb = rgb(fg); rr, rg, rb = rgb(red)
+    print(f"  \033[1;37m{name:<11}\033[0m "
+          f"\033[48;2;{r};{g};{b}m      \033[0m "
+          f"\033[38;2;{fr};{fg_};{fb}mAAAA\033[0m"
+          f"\033[38;2;{rr};{rg};{rb}mBBBB\033[0m  {desc}")'
+        echo
+        printf "  用法: ${B}pt35-bg void${R}  或  ${B}pt35-bg bg 0a0a0a${R}\n"
+        ;;
+
+    bg|fg)
+        [ $# -ge 1 ] || { err "用法: pt35-bg $CMD <颜色>"; exit 2; }
+        if [ "$CMD" = bg ]; then apply_colors "$1" "" ""; else
+            C=$(norm_color "$1") || { err "颜色无效: $1"; exit 2; }
+            edit_ini foreground "$C"; ok "前景 #$C"
+        fi
+        save_state; reload_foot
+        ;;
+
+    alpha)
+        [ $# -ge 1 ] || { err "用法: pt35-bg alpha <0.0-1.0>"; exit 2; }
+        V="$1"
+        awk -v v="$V" 'BEGIN{exit !(v+0>=0 && v+0<=1)}' || { err "alpha 必须在 0.0-1.0"; exit 2; }
+        edit_ini alpha "$V"
+        if awk -v v="$V" 'BEGIN{exit !(v+0<1)}'; then
+            edit_ini blur yes 2>/dev/null
+        fi
+        ok "透明度 $V"
+        [ "$(printf '%.0f' "$V")" = "0" ] && warn "alpha=0 会完全透明，你看不到内容"
+        save_state; reload_foot
+        ;;
+
+    blur)
+        V="${1:-yes}"
+        edit_ini blur "$V"; ok "毛玻璃 $V"
+        [ "$V" = yes ] && warn "blur 需要 alpha<1，否则无效果"
+        save_state; reload_foot
+        ;;
+
+    image)
+        if [ "${1:-}" = "none" ] || [ -z "${1:-}" ]; then
+            pkill -x swaybg 2>/dev/null
+            edit_ini alpha "1.0"; edit_ini blur "no"
+            ok "已移除壁纸，终端恢复不透明"
+            save_state; reload_foot; exit 0
+        fi
+        IMG="$1"
+        [ -f "$IMG" ] || { err "图片不存在: $IMG"; exit 2; }
+        if ! command -v swaybg >/dev/null 2>&1; then
+            err "需要 swaybg: pacman -S swaybg"; exit 1
+        fi
+        pkill -x swaybg 2>/dev/null; sleep 0.3
+        swaybg -i "$IMG" -m fill >/dev/null 2>&1 &
+        sleep 0.5
+        # 终端调成半透明，壁纸才透得出来
+        edit_ini alpha "0.82"; edit_ini blur "yes"
+        edit_ini image "$IMG"
+        ok "壁纸: $IMG"
+        ok "终端已调成 alpha=0.82 + blur（可再调: pt35-bg alpha 0.9）"
+        save_state; reload_foot
+        ;;
+
+    reload)
+        reload_foot
+        ;;
+
+    *)
+        # 试当预设
+        if preset_exists "$CMD"; then
+            BG=$(preset_get "$CMD" 2); FG=$(preset_get "$CMD" 3)
+            RED=$(preset_get "$CMD" 4)
+            DESC=$(preset_get "$CMD" 5)
+            hdr "套用预设: $CMD"
+            printf "  %s\n" "$DESC"
+            apply_colors "$BG" "$FG" "$RED"
+            # 预设一律恢复不透明（除非单独设了 image）
+            edit_ini alpha "1.0"; edit_ini blur "no"
+            save_state; reload_foot
+        else
+            err "未知预设或命令: $CMD"
+            printf '  可用预设: %s\n' "$(printf '%s' "$PRESETS" | awk -F'|' 'NF>1{printf "%s ",$1}')"
+            printf '  或看帮助: pt35-bg --help\n'
+            exit 2
+        fi
+        ;;
+esac
