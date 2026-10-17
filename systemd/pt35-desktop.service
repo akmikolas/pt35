@@ -1,24 +1,21 @@
 [Unit]
-Description=PocketTerm35 Chinese desktop (sway + foot + fcitx5)
+Description=PocketTerm35 中文桌面 (sway + foot + fcitx5)
 Documentation=file:/usr/local/bin/zhdesk
 After=systemd-user-sessions.service seatd.service
 Wants=kmsconvt@tty1.service
-# tty1 belongs to kmscon (rescue console); the desktop owns tty2.
 Conflicts=kmsconvt@tty1.service
 ConditionPathExists=!/etc/pt35-no-desktop
-# ★ StartLimit* must live in [Unit]. In [Service] systemd ignores them
-#   and logs "Unknown key ... ignoring".
+# ★ StartLimit* 必须放 [Unit] 段（放 [Service] 会被 systemd 忽略并告警）
 StartLimitBurst=5
 StartLimitIntervalSec=180
 
 [Service]
 Type=simple
-# ★ XDG_RUNTIME_DIR is /run/pt35, NOT /run/user/0.
-#   Reason (measured): with no lingering enabled for root, systemd destroys and
-#   recreates /run/user/0 every time the last session ends — taking the
-#   compositor's WAYLAND socket with it. The compositor keeps running but every
-#   client fails with "no compositor running". /run/pt35 is tied to the unit
-#   lifetime via RuntimeDirectory, so it is stable.
+# ★ 关键：XDG_RUNTIME_DIR 用 /run/pt35 而不是 /run/user/0
+#   原因（实测）：root 未开 lingering，systemd 会在【每次 SSH 会话断开】时
+#   销毁并重建 /run/user/0，把 sway 的 wayland socket 一起删掉
+#   → 桌面进程还活着但客户端连不上（grim/foot 报 "no compositor running"）。
+#   /run/pt35 由 systemd 的 RuntimeDirectory 管理，与登录会话无关。
 RuntimeDirectory=pt35
 RuntimeDirectoryMode=0700
 Environment=ZHDESK_DETACHED=1
@@ -27,17 +24,13 @@ Environment=ZHDESK_LANG=zh
 Environment=WLR_RENDERER=gles2
 Environment=XDG_RUNTIME_DIR=/run/pt35
 ExecStart=/usr/local/bin/zhdesk
-# KillMode=mixed: SIGTERM only to the main process so zhdesk can run its cleanup.
+# KillMode=mixed：只向主进程发 SIGTERM，让 zhdesk 有机会跑 cleanup
 KillMode=mixed
-# ★ Stopping must wait for the compositor to release DRM and shut clients down.
-#   That normally takes 3-8 s; 10 s is not enough and produces
-#   "stop-sigterm timed out" followed by SIGKILL, leaving seat/DRM dirty.
+# ★ 停止要等 sway 自己清理（sway 收到 SIGTERM 后会关客户端、释放 DRM，
+#   正常 3-8 秒；10 秒不够 → 实测会 "stop-sigterm timed out" 然后被 SIGKILL，
+#   导致下次 start 时 seat/DRM 状态不干净）
 TimeoutStopSec=35
-# kmscon restore must be async AND outside the cgroup: systemd SIGKILLs the whole
-# cgroup on stop, which would kill a synchronous `systemctl start` here.
+# 恢复 kmscon 必须【异步且脱离 cgroup】，否则会被 systemd 的 SIGKILL 打断
 ExecStopPost=-systemd-run --collect --quiet --unit=pt35-rescue /usr/local/bin/pt35-desktop-boot --restore
 Restart=on-failure
 RestartSec=3
-
-[Install]
-WantedBy=graphical.target

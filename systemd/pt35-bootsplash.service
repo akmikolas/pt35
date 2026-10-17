@@ -1,5 +1,5 @@
 [Unit]
-Description=PocketTerm35 CRT-glitch boot animation
+Description=PocketTerm35 共振风格开机动画 (Control: Resonance)
 Documentation=file:/usr/local/bin/pt35-bootsplash
 DefaultDependencies=no
 After=systemd-udev-settle.service local-fs.target
@@ -14,11 +14,15 @@ TTYPath=/dev/tty1
 StandardOutput=tty
 StandardError=journal
 Restart=no
+# 动画自己约 27 秒退出；这里给足余量
 TimeoutStopSec=15
-# ★ Async restore again: at this point the compositor still holds DRM master,
-#   so a synchronous `systemctl start kmsconvt@tty1` would fail and block until
-#   the unit times out ("State 'stop-post' timed out").
-ExecStopPost=-systemd-run --collect --quiet --unit=pt35-boot-rescue /bin/sh -c 'for i in $(seq 1 20); do systemctl is-active --quiet pt35-desktop.service && break; sleep 1; done; for j in 1 2 3 4 5 6; do systemctl start kmsconvt@tty1 2>/dev/null; systemctl is-active --quiet kmsconvt@tty1 && break; sleep 2; done; chvt 1 2>/dev/null || true'
+# ★ 恢复动作必须【异步】执行：
+#   之前用同步的 sh -c 重试启动 kmscon，但那时 sway 还占着 DRM master，
+#   kmscon 必然失败并阻塞到超时 → 服务变 failed (timeout)。
+#   改用 systemd-run 起一个独立瞬态单元，主服务立刻退出；
+#   恢复脚本自己在里面等 sway 就绪再拉 kmscon。
+ExecStopPost=-systemd-run --collect --quiet --unit=pt35-boot-rescue \
+    /bin/sh -c 'for i in $(seq 1 20); do systemctl is-active --quiet pt35-desktop.service && break; sleep 1; done; for j in 1 2 3 4 5 6; do systemctl start kmsconvt@tty1 2>/dev/null; systemctl is-active --quiet kmsconvt@tty1 && break; sleep 2; done; chvt 1 2>/dev/null || true'
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=PocketTerm35 first boot: install raspberrypi-overlays
+Documentation=file:/root/FIRST-BOOT-README.txt
+ConditionPathExists=!/var/lib/pt35-firstboot.done
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 等网络真的可用（最多 2 分钟）
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do ping -c1 -W2 archlinuxarm.org >/dev/null 2>&1 && exit 0; sleep 2; done; exit 0'
+ExecStart=/usr/bin/pacman -Syu --noconfirm --needed raspberrypi-overlays
+ExecStartPost=/usr/bin/install -d /var/lib
+ExecStartPost=/usr/bin/touch /var/lib/pt35-firstboot.done
+ExecStartPost=/bin/systemctl --no-block restart systemd-udevd.service
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

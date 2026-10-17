@@ -1,0 +1,182 @@
+#!/bin/bash
+# help: 桌面 | 管理桌面开机自启（on/off/status/test）
+# pt35-desktop-boot —— PocketTerm35 开机自动进入中文桌面（带安全回退）
+#
+# 设计目标：
+#   1. 开机自动进入 sway + foot + fcitx5 中文桌面
+#   2. 桌面崩溃/退出时，自动回退到 kmscon 或 getty，**绝不黑屏**
+#   3. 可一键关闭自启（pt35-desktop-boot off），回到纯终端
+#   4. 即使桌面起不来，SSH 仍可用（sshd 不受影响）
+#
+# 用法:
+#   pt35-desktop-boot            查看状态
+#   pt35-desktop-boot on         启用开机自启
+#   pt35-desktop-boot off        关闭自启（回到 kmscon 纯终端）
+#   pt35-desktop-boot disable    彻底屏蔽（连救援 VT 也不留，慎用）
+#   pt35-desktop-boot test       立即测试启动桌面
+set -u
+
+SVC=pt35-desktop.service
+UNIT=/etc/systemd/system/$SVC
+grn=$'\033[32m'; red=$'\033[31m'; yel=$'\033[33m'; dim=$'\033[2m'; rst=$'\033[0m'
+
+status() {
+    echo "PocketTerm35 桌面自启状态"
+    echo "  ${dim}─────────────────────────────${rst}"
+    printf "  自启服务 (%s): %s\n" "$SVC" "$(systemctl is-enabled $SVC 2>/dev/null || echo '未安装')"
+    printf "  当前运行:               %s\n" "$(systemctl is-active $SVC 2>/dev/null || echo inactive)"
+    printf "  kmscon (救援 VT1):      %s / %s\n" \
+        "$(systemctl is-enabled kmsconvt@tty1 2>/dev/null || echo -)" \
+        "$(systemctl is-active kmsconvt@tty1 2>/dev/null || echo -)"
+    printf "  getty  (兜底 VT1):      %s\n" "$(systemctl is-enabled getty@tty1 2>/dev/null || echo -)"
+    echo
+    printf "  sway: %s 进程   foot: %s   fcitx5: %s\n" \
+        "$(pgrep -c sway 2>/dev/null || echo 0)" \
+        "$(pgrep -c foot 2>/dev/null || echo 0)" \
+        "$(pgrep -c fcitx5 2>/dev/null || echo 0)"
+    echo
+    echo "  ${dim}用法: on | off | test | disable${rst}"
+}
+
+install_unit() {
+    cat > "$UNIT" <<'EOF'
+[Unit]
+Description=PocketTerm35 中文桌面 (sway + foot + fcitx5)
+Documentation=man:sway(1)
+# 等登录会话就绪、seatd 可用后再起桌面
+After=systemd-user-sessions.service seatd.service
+Wants=seatd.service
+# ★ 先让 kmscon 起来（它是救援通道），桌面再停掉它释放 DRM master。
+#   这样保证任何时刻都有一条能用的显示通道，不会出现"两边都没起来"的黑屏窗口。
+After=kmsconvt@tty1.service
+Wants=kmsconvt@tty1.service
+# tty1 保留给 kmscon/getty 作为救援通道；桌面跑在 tty2
+Conflicts=getty@tty2.service
+# 注意：不要设 OnFailure=getty@tty1.service —— getty 与 kmsconvt@tty1 在
+# 同一个 VT 上互斥（kmsconvt@.service 里有 Conflicts=getty@%i.service），
+# 让 getty 兜底反而会把 kmscon 挤掉，实测导致救援终端反复丢失。
+# 真正的兜底由 ExecStopPost 的 --restore 完成（带重试，确定性恢复 kmscon）。
+# 用户可以在 /etc/pt35-no-desktop 放个文件临时跳过桌面
+ConditionPathExists=!/etc/pt35-no-desktop
+# 崩溃重启上限（这两个键属于 [Unit] 段）
+StartLimitBurst=3
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+# 直接前台运行 zhdesk（不用 setsid；systemd 本身就是脱离会话的）
+ExecStart=/usr/local/bin/zhdesk
+# 环境：VT2 + 中文优先
+Environment=ZHDESK_DETACHED=1
+Environment=ZHDESK_VT=2
+Environment=ZHDESK_LANG=zh
+Environment=WLR_RENDERER=gles2
+Environment=XDG_RUNTIME_DIR=/run/user/0
+# ★ 桌面退出后确定性恢复救援终端。
+#   实测坑：sway 退出后 DRM master 不是立刻释放，kmscon 若马上启动会报
+#   "Cannot set drm master for /dev/dri/card1"，随后 "vt_timeout: failed to
+#   wake up after 20 retries" 并以失败告终 → 救援终端丢失、可能黑屏。
+#   所以这里带重试，最多 5 次、间隔 2 秒，成功即止。
+# ★ 关键：恢复动作必须【脱离本服务的 cgroup 且异步执行】，原因有二：
+#   1) systemd 停止本服务时向整个 cgroup 发 SIGTERM，
+#      里面的 `systemctl start kmsconvt@tty1` 子进程会被 SIGKILL → kmscon 起不来；
+#   2) `systemd-run --scope` 是【同步】的，会一直阻塞到脚本结束，
+#      导致 State 'stop-post' timed out（实测 20 秒超时、服务变 failed）。
+#   改用【瞬态服务】（不带 --scope）→ 立即返回，恢复脚本在独立单元里跑完。
+ExecStopPost=-systemd-run --collect --quiet --unit=pt35-rescue /usr/local/bin/pt35-desktop-boot --restore
+# 崩溃自动重启（最多 3 次，避免无限重启循环）
+# 主进程(zhdesk)先收 SIGTERM，子进程稍后 → 给 zhdesk 的 trap 留出时间
+KillMode=mixed
+Restart=on-failure
+RestartSec=5
+# 给足时间让 sway 正常退出
+TimeoutStopSec=20
+# 需要 DRM 与输入设备
+SupplementaryGroups=video render input
+
+[Install]
+WantedBy=graphical.target
+EOF
+    systemctl daemon-reload
+}
+
+# ── 恢复救援终端（由 systemd-run 脱离 cgroup 调用）──────────────
+# 为什么必须脱离：systemd 停止 pt35-desktop 时会向【整个 cgroup】发 SIGTERM，
+# 里面任何 `systemctl start kmsconvt@tty1` 子进程都会被 SIGKILL，
+# 导致 kmscon 起不来、sway 仍占 DRM master、ExecStopPost 阻塞到超时。
+restore_rescue() {
+    # 等 sway 真正退出并释放 DRM master（最多 15 秒）
+    for _ in $(seq 1 15); do
+        pgrep -x sway >/dev/null 2>&1 || break
+        sleep 1
+    done
+    # 确保 getty 不占 tty1（kmsconvt@.service 有 Conflicts=getty@%i.service）
+    systemctl stop getty@tty1 2>/dev/null
+    # 带重试启动 kmscon
+    for i in 1 2 3 4 5 6; do
+        systemctl start kmsconvt@tty1 2>/dev/null
+        systemctl is-active --quiet kmsconvt@tty1 && break
+        sleep 2
+    done
+    chvt 1 2>/dev/null || true
+    systemctl is-active --quiet kmsconvt@tty1
+}
+
+case "${1:-}" in
+    --restore)
+        restore_rescue
+        exit $?
+        ;;
+    on)
+        install_unit
+        # 关闭"临时跳过"标记
+        rm -f /etc/pt35-no-desktop
+        # 保留 kmscon 与 getty 作为救援（不要 disable 它们）
+        systemctl enable $SVC >/dev/null 2>&1
+        echo "${grn}✅${rst} 已启用开机自启中文桌面"
+        echo
+        echo "  开机流程:"
+        echo "    ① kmscon 在 tty1 先起（救援通道）"
+        echo "    ② $SVC 在 tty2 启动 sway + foot + fcitx5"
+        echo "    ③ 桌面会自动停掉 kmscon 释放 DRM"
+        echo "    ④ 桌面退出 → 自动恢复 kmscon（或 getty 兜底）"
+        echo
+        echo "  ${dim}救援方式: 桌面挂了按 Ctrl+Alt+F1 回 kmscon；"
+        echo "            或 SSH 进来执行 pt35-desktop-boot off${rst}"
+        ;;
+    off)
+        systemctl disable $SVC >/dev/null 2>&1
+        systemctl stop $SVC >/dev/null 2>&1
+        touch /etc/pt35-no-desktop     # 即使被别的路径拉起也跳过
+        systemctl start kmsconvt@tty1 >/dev/null 2>&1
+        echo "${grn}✅${rst} 已关闭桌面自启，回到 kmscon 纯终端"
+        echo "  ${dim}手动进桌面仍然可用: zhdesk${rst}"
+        ;;
+    test)
+        install_unit
+        echo "立即启动桌面..."
+        systemctl start $SVC 2>&1 | sed 's/^/  /'
+        sleep 12
+        printf "  服务: %s\n" "$(systemctl is-active $SVC 2>/dev/null)"
+        printf "  sway=%s foot=%s fcitx5=%s\n" \
+            "$(pgrep -c sway 2>/dev/null || echo 0)" \
+            "$(pgrep -c foot 2>/dev/null || echo 0)" \
+            "$(pgrep -c fcitx5 2>/dev/null || echo 0)"
+        echo "  ${dim}按 Ctrl+Alt+F2 查看桌面${rst}"
+        ;;
+    disable)
+        echo "${yel}⚠️${rst} 这会禁用救援通道，若桌面起不来会黑屏。"
+        echo "  继续请再执行一次: pt35-desktop-boot disable --force"
+        [ "${2:-}" = "--force" ] || exit 1
+        systemctl disable $SVC >/dev/null 2>&1
+        systemctl disable kmsconvt@tty1 >/dev/null 2>&1
+        echo "  已禁用桌面自启 + kmscon（仅 getty 兜底）"
+        ;;
+    ""|status)
+        status
+        ;;
+    *)
+        echo "用法: pt35-desktop-boot [on|off|test|status|disable]" >&2
+        exit 1
+        ;;
+esac

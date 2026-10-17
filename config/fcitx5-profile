@@ -1,20 +1,23 @@
 [Groups/0]
-# 组名
-Name=默认
-# 键盘布局
+# Group Name
+Name=Default
+# Layout
 Default Layout=us
-# 默认输入法（**关键**：设为 pinyin，否则启动后是英文）
-DefaultIM=pinyin
+# Default Input Method
+DefaultIM=keyboard-us
 
 [Groups/0/Items/0]
-# 第一项必须是 pinyin，fcitx5 才会默认启用它
+# Name
 Name=pinyin
-Layout=
+# Layout
+# Layout=
 
 [Groups/0/Items/1]
-# 次输入法：英文键盘，用 Ctrl+Space 切换
+# Name
 Name=keyboard-us
-Layout=
+# Layout
+# Layout=
 
 [GroupOrder]
-0=默认
+0=Default
+
