@@ -14,6 +14,20 @@ found**, not just the fix — the diagnostic path is usually the reusable part.
 | 07 | [开机动画设计](07-开机动画设计.md) | ⭐ **块字符是双宽的**；终端尺寸不能靠字号推算 |
 | 08 | [系统深挖与Bug修复](08-系统深挖与Bug修复.md) | ⭐ **`/run/user/$UID` 会随会话销毁**；getty 抢 tty1；restart 竞态 |
 | 09 | [xray-knife](09-xray-knife.md) | 代理工具链用法（凭据随机生成的坑） |
+| 10 | [静默损坏与内容校验](10-静默损坏与内容校验.md) | ⭐ **`pacman -Qkk` 查不出内容损坏**；SD 卡物理失效的识别 |
+
+## Tools worth knowing
+
+`tools/verify-content.py` — **the only reliable corruption detector.** `pacman -Qkk`
+compares size/permissions/timestamps via mtree and reports "0 altered files" on a
+library whose middle 14 KB has been overwritten with `0xFF`. This tool diffs every
+installed file against its original package in `/var/cache/pacman/pkg`:
+
+```bash
+sudo pacman -Sw --needed $(pacman -Qq)    # populate the cache first
+sudo verify-content.py                    # report
+sudo verify-content.py --fix <pkg>        # restore from cache
+```
 
 ## If you only read three
 
@@ -23,6 +37,8 @@ found**, not just the fix — the diagnostic path is usually the reusable part.
    `ldd`, load fine, and then abort. Only a checksum catches them.
 3. **[08](08-系统深挖与Bug修复.md)** — three systemd/lifetime issues that each look like
    "the desktop randomly died".
+4. **[10](10-静默损坏与内容校验.md)** — a library whose middle 14 KB is `0xFF` passes
+   `pacman -Qkk`, `ldd`, and an ELF magic check. How to actually catch it.
 
 ## Redaction
 

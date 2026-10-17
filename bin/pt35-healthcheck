@@ -33,7 +33,7 @@ pt35-healthcheck —— PocketTerm35 系统健康自检
 为什么需要它:
   本机因非正常断电损坏过 300+ 文件，特征是"文件大小正确、
   头部正常、但内容错误"，普通检查查不出来，必须用校验和
-  或实际加载测试。--full 用 pacman -Qkk 做全量校验。
+  或实际加载测试。--full 逐字节对比包缓存做内容校验（能查出 pacman -Qkk 漏掉的静默损坏）。
 USAGE
         exit 0
         ;;
@@ -119,21 +119,41 @@ fi
 
 if [ "${1:-}" = "--full" ]; then
     echo
-    echo "── 8. 全量校验和（pacman -Qkk，耗时较长）──"
-    echo "${DIM}  检查中...${RST}"
-    pacman -Qkk > /tmp/qkk-check.txt 2>&1
-    REAL=$(grep -E "(SHA256 checksum mismatch|Size mismatch)" /tmp/qkk-check.txt 2>/dev/null | \
-           grep -v "^backup file" | wc -l)
-    if [ "$REAL" -eq 0 ]; then
-        ok "无内容损坏"
+    echo "── 8. 内容校验（逐字节对比包缓存，耗时较长）──"
+    echo "${DIM}  为什么不用 pacman -Qkk：它只比大小/权限/时间戳，${RST}"
+    echo "${DIM}  文件中间被填成 0x00/0xFF 时它照样报 \"0 altered files\"。${RST}"
+    echo
+
+    if ! [ -x /usr/local/bin/verify-content.py ]; then
+        warn "verify-content.py 未安装 —— 回退到 pacman -Qkk（不可靠）"
+        pacman -Qkk > /tmp/qkk-check.txt 2>&1
+        REAL=$(grep -cE "SHA256 checksum mismatch" /tmp/qkk-check.txt 2>/dev/null || echo 0)
+        [ "$REAL" -eq 0 ] && ok "pacman -Qkk 无异常" \
+            || bad "$REAL 个文件异常，详见 /tmp/qkk-check.txt"
     else
-        bad "$REAL 个文件内容损坏，详见 /tmp/qkk-check.txt"
-        grep -E "(SHA256 checksum mismatch|Size mismatch)" /tmp/qkk-check.txt 2>/dev/null | \
-            grep -v "^backup file" | head -10 | sed "s/^warning: //; s/^/      /"
+        CACHED=$(ls /var/cache/pacman/pkg/*.pkg.tar.* 2>/dev/null | grep -vc '\.sig$')
+        if [ "$CACHED" -lt 50 ]; then
+            warn "包缓存只有 $CACHED 个 —— 校验覆盖面不足"
+            echo "${DIM}    先补全: sudo pacman -Sw --needed \$(pacman -Qq)${RST}"
+        fi
+        echo "${DIM}  对比 $CACHED 个缓存包，可能需要几分钟...${RST}"
+        /usr/local/bin/verify-content.py --deep > /tmp/verify-content.txt 2>&1
+        RC=$?
+        if [ "$RC" -eq 0 ]; then
+            ok "全部文件内容一致（$(grep -c '✓' /tmp/verify-content.txt 2>/dev/null) 个包）"
+        elif [ "$RC" -eq 1 ]; then
+            N=$(grep -cE "^\s+·" /tmp/verify-content.txt 2>/dev/null || echo '?')
+            bad "$N 个文件内容损坏！详见 /tmp/verify-content.txt"
+            grep -E "^\s+·" /tmp/verify-content.txt 2>/dev/null | head -10 | \
+                sed 's/\x1b\[[0-9;]*m//g; s/^/      /'
+            echo "${DIM}    修复: sudo verify-content.py --fix <包名>${RST}"
+        else
+            warn "校验未完成（缓存包缺失），详见 /tmp/verify-content.txt"
+        fi
     fi
 else
     echo
-    echo "${DIM}  提示: 用 pt35-healthcheck --full 做全量校验和检查${RST}"
+    echo "${DIM}  提示: --full 做逐字节内容校验（检查静默损坏）${RST}"
 fi
 
 echo
