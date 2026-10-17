@@ -38,6 +38,28 @@ CACHE_DIR = Path("/var/cache/pacman/pkg")
 CACHE_SUFFIXES = (".pkg.tar.xz", ".pkg.tar.zst", ".pkg.tar.gz", ".pkg.tar.bz2")
 ARCHES = ("aarch64", "x86_64", "armv7h", "any", "arm", "i686")
 
+# 用户有权修改的配置 —— 不该从包还原（否则会覆盖真实配置）
+USER_EDITABLE = (
+    "/etc/locale.gen", "/etc/locale.conf", "/etc/environment", "/etc/hostname",
+    "/etc/hosts", "/etc/fstab", "/etc/crypttab", "/etc/resolv.conf",
+    "/etc/nsswitch.conf", "/etc/man_db.conf", "/etc/pacman.conf",
+    "/etc/mkinitcpio.conf", "/etc/ssh/sshd_config", "/etc/ssh/ssh_config",
+    "/etc/systemd/journald.conf", "/etc/systemd/logind.conf",
+    "/etc/NetworkManager/", "/etc/systemd/network/", "/etc/systemd/system/",
+    "/etc/default/", "/etc/profile.d/", "/etc/sysctl.d/", "/etc/modprobe.d/",
+    "/etc/udev/rules.d/", "/etc/X11/", "/etc/fonts/", "/etc/wpa_supplicant/",
+    # 树莓派启动配置
+    "/boot/config.txt", "/boot/cmdline.txt", "/boot/firmware/config.txt",
+    "/boot/firmware/cmdline.txt",
+)
+
+
+def is_user_editable(path: str) -> bool:
+    """这个文件是用户配置吗？（是则不该从包还原）"""
+    if path in USER_EDITABLE:
+        return True
+    return any(path.startswith(p) for p in USER_EDITABLE if p.endswith("/"))
+
 R = "\033[0m"; B = "\033[1;37m"; G = "\033[32m"; Y = "\033[33m"
 RD = "\033[31m"; D = "\033[90m"
 
@@ -173,6 +195,7 @@ def verify_pkg(pkg: str, fix: bool, deep: bool):
             return None
 
         checked = 0
+        user_edited = 0
         bad = []
         for m in members:
             rel = m.name
@@ -181,6 +204,9 @@ def verify_pkg(pkg: str, fix: bool, deep: bool):
             if not src.is_file() or not dst.is_file():
                 continue
             checked += 1
+            if is_user_editable("/" + rel):
+                user_edited += 1
+                continue
             if src.stat().st_size != dst.stat().st_size:
                 bad.append((rel, "大小不符", None))
                 continue
@@ -195,8 +221,9 @@ def verify_pkg(pkg: str, fix: bool, deep: bool):
                             note = f"连续 {mx} 字节 {which}"
                 bad.append((rel, "内容不一致", note))
 
+        ue = f"  {D}({user_edited} 个配置跳过){R}" if user_edited else ""
         if not bad:
-            print(f"  {G}✓{R} {pkg:<24} {checked:>5} 文件  一致")
+            print(f"  {G}✓{R} {pkg:<24} {checked:>5} 文件  一致{ue}")
         else:
             print(f"  {RD}✗{R} {pkg:<24} {checked:>5} 文件  "
                   f"{RD}{len(bad)} 个不一致{R}")
