@@ -1,0 +1,13 @@
+# ===== 追加到 /boot/firmware/config.txt 末尾 =====
+# Waveshare PocketTerm35 (Pi 4B) 硬件配置
+# 屏幕: HDMI 输出经 vc4 KMS（板上 HDMI→DPI 桥接），无需 DPI overlay
+# 触摸: Goodix GT911 走 I2C1（实测地址 0x5d）
+# 键盘: RP2040 接 USB-C/OTG 口，必须开 dwc2 host 模式
+# 风扇: 三线风扇，pin4=5V / pin6=GND / pin8=GPIO14（软件 PWM 调速）
+
+dtparam=i2c_arm=on
+dtoverlay=dwc2,dr_mode=host
+dtoverlay=waveshare-35dpi-5b
+dtoverlay=waveshare-35dpi-4b
+dtoverlay=pwm-gpio-fan,fan_gpio=14,fan_temp0=35000,fan_temp1=38000,fan_temp2=41000,fan_temp3=45000,fan_temp0_hyst=2000,fan_temp1_hyst=2000,fan_temp2_hyst=2000,fan_temp3_hyst=2000,fan_temp0_speed=120,fan_temp1_speed=180,fan_temp2_speed=220,fan_temp3_speed=255
+temp_limit=80

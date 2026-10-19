@@ -1,0 +1,119 @@
+#!/bin/bash
+# help: 电源 | 安全关机（等脏页归零，防 SD 卡损坏）
+# pt35-poweroff —— PocketTerm35 (Pi 4B) 安全关机
+#
+# 官方 FAQ 原文：
+
+#   "请先通过系统关机（或短按 Pi 5 侧面硅胶电源按键执行关机），
+#    待设备完全关机后，如有必要，再双击顶部电源按键断开设备电源。"
+#
+# ⚠️ Pi 4B **没有** Pi 5 那个侧面按键，所以只能靠系统关机。
+#
+# ⚠️ 关键：poweroff 之后 Pi 只是 halt，**电池仍在供电**（约 1.85W）。
+#    必须再双击顶部电源键才真正断电。在 halt 中途拔电 = 数据损坏。
+#
+# 背景：本机曾因"写入未落盘 + 非正常断电"造成 4 次系统库损坏
+#      （libvulkan / libacl+libutil / libz 等），此脚本用于避免重演。
+set -u
+
+# ── 参数处理（★ 安全：本命令会关机，必须有 --help / --dry-run）──
+case "${1:-}" in
+    -h|--help)
+        cat <<'USAGE'
+pt35-poweroff —— PocketTerm35 (Pi 4B) 安全关机
+
+用法:
+  pt35-poweroff            交互式：确认后关机（等脏页归零再 poweroff）
+  pt35-poweroff -y         跳过确认直接关机
+  pt35-poweroff -n|--dry-run   只做检查并显示会做什么，不真关机
+  pt35-poweroff -h|--help  显示本帮助
+
+为什么需要本命令:
+  直接 poweroff 只进入 halt，电池仍在供电（约 1.85 W）。
+  必须先等脏页归零、屏幕全黑、绿灯停止闪烁，再双击顶部电源键断电。
+  否则 SD 卡会因写入未落盘而损坏（本机已因此损坏 300+ 文件）。
+
+相关: pt35-healthcheck（检查文件是否已损坏）
+USAGE
+        exit 0
+        ;;
+esac
+
+# ── 解析 -y / -n（--dry-run）─────────────────────────────
+DRY_RUN=0
+SKIP_CONFIRM=0
+for a in "$@"; do
+    case "$a" in
+        -n|--dry-run) DRY_RUN=1 ;;
+        -y|--yes)     SKIP_CONFIRM=1 ;;
+    esac
+done
+
+echo "╔══════════════════════════════════════════════════════╗"
+echo "║        PocketTerm35 安全关机 (Pi 4B)                 ║"
+echo "╚══════════════════════════════════════════════════════╝"
+echo
+
+# 1) 检查是否有正在进行的写操作（pacman 等）
+if pgrep -x apt-get >/dev/null 2>&1 || pgrep -x dpkg >/dev/null 2>&1 || pgrep -x apt >/dev/null 2>&1; then
+    echo "⚠️  检测到 apt/dpkg 正在运行！"
+    echo "    强行关机会造成软件包损坏。请等它完成，或先中断它。"
+    printf "    仍要继续？(输入 yes 继续) "
+    read -r ans
+    [ "$ans" = "yes" ] || { echo "已取消。"; exit 1; }
+    echo
+fi
+
+# 2) 检查脏页（有多少数据还在缓存里没落盘）
+DIRTY_KB=$(awk '/^Dirty:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+printf "  待写回数据: %s KB\n" "$DIRTY_KB"
+
+# 3) 强制同步（这是防损坏的核心步骤）
+echo "  正在同步数据到 SD 卡（sync）..."
+sync
+sync
+# 等待写回真正完成（Dirty 归零）
+for i in $(seq 1 30); do
+    d=$(awk '/^Dirty:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    [ "$d" -lt 64 ] 2>/dev/null && break
+    sleep 1
+done
+printf "  同步后待写回: %s KB\n" "$(awk '/^Dirty:/ {print $2}' /proc/meminfo 2>/dev/null || echo '?')"
+echo
+
+# 4) 记录本次关机（便于事后核对）
+logger -t pt35-poweroff "user requested safe shutdown (dirty=${DIRTY_KB}KB)"
+
+cat <<'EOF'
+────────────────────────────────────────────────────────
+即将关机。请在关机后按以下步骤操作：
+
+  ① 等待屏幕变黑、绿灯停止闪烁
+     （halt 后电池仍供电，绿灯/电量灯可能仍亮 —— 这是正常的）
+
+  ② 确认没有磁盘活动后，【双击顶部电源键】断开电池
+
+  ⚠️ 不要在绿灯还闪的时候拔电/拔电池
+────────────────────────────────────────────────────────
+EOF
+echo
+
+# 5) 执行关机
+# ── dry-run 到此为止（不真关机）─────────────────────────
+if [ "$DRY_RUN" = "1" ]; then
+    echo
+    echo "  ✅ --dry-run：以上是全部检查，未执行关机。"
+    echo "     去掉 --dry-run 才会真正关机。"
+    exit 0
+fi
+
+if [ "$SKIP_CONFIRM" = "1" ]; then
+    echo "  3 秒后关机..."
+    sleep 3
+else
+    printf "  按 Enter 关机，Ctrl-C 取消: "
+    read -r _
+fi
+
+sync
+systemctl poweroff

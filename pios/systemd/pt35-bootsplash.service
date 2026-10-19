@@ -1,0 +1,27 @@
+[Unit]
+Description=PocketTerm35 共振风格开机动画 (Control: Resonance)
+Documentation=file:/usr/local/bin/pt35-bootsplash
+# 不阻塞整个启动链，但要在桌面之前把动画播完
+After=systemd-udev-settle.service local-fs.target
+Before=lightdm.service
+Conflicts=getty@tty1.service
+ConditionPathExists=!/etc/pt35-no-bootsplash
+# 动画失败也绝不能挡住开机
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+# 切到 tty1 播动画（桌面在 tty7，互不干扰）
+ExecStartPre=-/bin/sh -c 'chvt 1 2>/dev/null || true'
+ExecStart=/usr/local/bin/pt35-bootsplash
+# 播完切回桌面 VT
+ExecStopPost=-/bin/sh -c 'chvt 7 2>/dev/null || true'
+TTYPath=/dev/tty1
+StandardOutput=tty
+StandardError=journal
+TimeoutStartSec=30
+# 失败不重试，直接放行
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

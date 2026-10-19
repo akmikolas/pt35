@@ -1,0 +1,93 @@
+#!/bin/bash
+# help: 系统 | 出门前状态自检
+# pt35-check —— PocketTerm35 出门前状态自检（Raspberry Pi OS 版）
+#
+# 一次看完：显示 / 触摸 / 键盘 / 风扇 / 网络 / 输入法 / 磁盘
+# 用法: pt35-check
+set -u
+G=$'\033[32m'; R2=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; B=$'\033[1m'; N=$'\033[0m'
+
+ok(){ printf "  ${G}✓${N} %-12s %s\n" "$1" "$2"; }
+bad(){ printf "  ${R2}✗${N} %-12s %s\n" "$1" "$2"; }
+warn(){ printf "  ${Y}!${N} %-12s %s\n" "$1" "$2"; }
+
+echo "${B}┌─ PocketTerm35 状态自检 ────────────────────────────${N}"
+
+# ── 1. 显示 ──────────────────────────────────────
+echo "${D}── 显示 ──${N}"
+CONN=$(for s in /sys/class/drm/card*-HDMI*/status; do [ -f "$s" ] && grep -q connected "$s" && basename "$(dirname "$s")"; done | head -1)
+if [ -n "$CONN" ]; then
+    MODE=$(head -1 "/sys/class/drm/$CONN/modes" 2>/dev/null)
+    ok "屏幕" "$CONN  $MODE"
+else
+    bad "屏幕" "没有已连接的 HDMI"
+fi
+FB=$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null)
+[ -n "$FB" ] && ok "framebuffer" "$FB" || warn "framebuffer" "无 /dev/fb0（纯 KMS 时可忽略）"
+
+# ── 2. 触摸 ──────────────────────────────────────
+echo "${D}── 触摸 ──${N}"
+TOUCH=$(grep -l "Goodix\|goodix\|gt911" /sys/class/input/input*/name 2>/dev/null | head -1)
+if [ -n "$TOUCH" ]; then
+    EV=$(basename "$(dirname "$(dirname "$TOUCH")")")
+    ok "GT911" "$(cat "$TOUCH")  → $EV"
+else
+    bad "GT911" "未找到触摸设备（i2cdetect -y 1 查 0x5d）"
+fi
+
+# ── 3. 键盘 ──────────────────────────────────────
+echo "${D}── 键盘 ──${N}"
+if lsusb 2>/dev/null | grep -q "1209:"; then
+    ok "RP2040" "$(lsusb | grep '1209:' | sed 's/.*ID //')"
+else
+    bad "RP2040" "未检测到 USB 键盘（检查 dwc2,dr_mode=host）"
+fi
+
+# ── 4. 风扇与温度 ─────────────────────────────────
+echo "${D}── 散热 ──${N}"
+H=""
+for h in /sys/class/hwmon/hwmon*; do
+    [ -f "$h/name" ] || continue
+    case "$(cat "$h/name" 2>/dev/null)" in pwmfan|pwm_fan|fan*) H="$h"; break;; esac
+done
+T=$(awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+if [ -n "$H" ]; then
+    P=$(cat "$H/pwm1" 2>/dev/null || echo 0)
+    ST=$(cat /sys/class/thermal/cooling_device0/cur_state 2>/dev/null || echo "?")
+    TA=${T%.*}
+    if [ "${TA:-0}" -lt 50 ] 2>/dev/null; then ok "温度" "${T}°C  风扇 ${P}/255 (档 ${ST})"
+    elif [ "${TA:-0}" -lt 65 ] 2>/dev/null; then warn "温度" "${T}°C  风扇 ${P}/255"
+    else bad "温度" "${T}°C  过热！"; fi
+else
+    warn "风扇" "未找到 pwmfan（检查 pwm-gpio-fan overlay）"
+fi
+
+# ── 5. 桌面与输入法 ───────────────────────────────
+echo "${D}── 桌面 ──${N}"
+pgrep -x labwc >/dev/null && ok "labwc" "运行中 pid=$(pgrep -x labwc)" || warn "labwc" "未运行"
+pgrep -x fcitx5 >/dev/null && ok "fcitx5" "运行中 pid=$(pgrep -x fcitx5)" || warn "fcitx5" "未运行（中文输入不可用）"
+ok "中文字体" "$(fc-list :lang=zh 2>/dev/null | wc -l) 个"
+
+# ── 6. 网络 ──────────────────────────────────────
+echo "${D}── 网络 ──${N}"
+for i in eth0 wlan0; do
+    IP=$(ip -4 -br addr show "$i" 2>/dev/null | awk '{print $3}')
+    if [ -n "$IP" ]; then
+        CN=$(nmcli -t -f GENERAL.CONNECTION dev show "$i" 2>/dev/null | cut -d: -f2)
+        ok "$i" "$IP  ($CN)"
+    else
+        warn "$i" "无 IP"
+    fi
+done
+if command -v tailscale >/dev/null 2>&1; then
+    ok "tailscale" "$(tailscale status --json 2>/dev/null | grep -oE '"BackendState":"[^"]*"' | cut -d'"' -f4) $(tailscale ip -4 2>/dev/null | head -1)"
+else
+    warn "tailscale" "未安装"
+fi
+
+# ── 7. 磁盘 ──────────────────────────────────────
+echo "${D}── 存储 ──${N}"
+ok "根分区" "$(df -h / | tail -1 | awk '{print $3"/"$2" ("$5")"}')"
+ok "启动分区" "$(df -h /boot/firmware 2>/dev/null | tail -1 | awk '{print $3"/"$2" ("$5")"}')"
+
+echo "${B}└────────────────────────────────────────────────────${N}"

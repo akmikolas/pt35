@@ -1,0 +1,37 @@
+#!/bin/bash
+# help: 桌面 | 重启桌面会话（lightdm + labwc）
+# pt35-desktop-restart —— 重启图形会话
+#
+# Raspberry Pi OS 用 lightdm 拉起 labwc（Wayland）。
+# 桌面卡死/壁纸不刷新/输入法图标消失时，重启一次会话即可。
+#
+# 用法:
+#   pt35-desktop-restart            重启 lightdm（会退出当前桌面！）
+#   pt35-desktop-restart --soft     只重启 labwc，不碰 lightdm
+#   pt35-desktop-restart --status   查看当前状态
+set -u
+G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'
+
+status() {
+    echo "${D}── 桌面状态 ──${N}"
+    printf "  %-14s %s\n" "lightdm" "$(systemctl is-active lightdm 2>/dev/null)"
+    printf "  %-14s %s\n" "labwc" "$(pgrep -x labwc >/dev/null && echo "运行中 (pid $(pgrep -x labwc))" || echo 未运行)"
+    printf "  %-14s %s\n" "fcitx5" "$(pgrep -x fcitx5 >/dev/null && echo "运行中 (pid $(pgrep -x fcitx5))" || echo 未运行)"
+    printf "  %-14s %s\n" "session" "$(loginctl list-sessions --no-legend 2>/dev/null | awk '$4=="seat0"{print $1}' | head -1)"
+}
+
+case "${1:-}" in
+  --status|status) status ;;
+  --soft|soft)
+      echo "${Y}重启 labwc（不退出 lightdm）…${N}"
+      pkill -x labwc 2>/dev/null
+      sleep 2
+      pgrep -x labwc >/dev/null && echo "  ${G}✓${N} labwc 已重启" || echo "  ${R}✗${N} labwc 未自动恢复，试试 --soft 之外的方式"
+      ;;
+  *)
+      echo "${Y}正在重启 lightdm —— 当前桌面会退出${N}"
+      sudo systemctl restart lightdm
+      sleep 3
+      status
+      ;;
+esac

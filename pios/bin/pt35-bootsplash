@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+# help: 显示 | 共振风格开机动画（由 systemd 调用）
+"""pt35-bootsplash —— 《控制：共振》风格的开机动画（写入 tty1）
+
+设计原则（都是从这台机器的实测踩坑里来的）：
+  * **纯标准库**：不依赖 PIL / numpy，设备上直接能跑
+  * **只用验证过的字形**：kmscon 的 Terminus 缺 ◤◥◢◣⚠，已避开
+  * **不碰 initramfs / 内核参数**：出问题删掉服务即可完全恢复
+  * **ANSI 整屏重绘**：\\033[H 归位 + 逐行覆盖 → 动画
+  * **kmscon 接管即让位**：不跟终端抢屏幕
+
+动态元素（呼应 Control 的机构仪表 + 超现实畸变）：
+  █ 中心共振核   呼吸脉动（█ ⇄ + ⇄ -）
+  Δ 百分比       与真实启动进度联动
+  共振条         红色 █ 随进度增长
+  HISS 条        灰色 ▒ 反向衰减
+  扫描线         ░ 自上而下循环扫过碑体
+  SIGNAL 提示    进度突破阈值时出现
+
+用法:
+  pt35-bootsplash            正常运行（由 systemd 调用，写 /dev/tty1）
+  pt35-bootsplash --stdout   输出到当前终端（调试/预览）
+  pt35-bootsplash --frames 5 只渲染 5 帧（供截图验证）
+"""
+import math
+import os
+import random
+import re
+import sys
+import time
+
+COLS, ROWS = 80, 30
+E = '\033'
+R = E + '[0m'
+def fg(n): return f'{E}[{n}m'
+
+BRIGHT = fg('1;37')     # 亮白（碑体高光）
+GRAY   = fg('37')       # 灰白（碑体）
+DIM    = fg('90')       # 暗灰
+DARK   = fg('2;37')     # 更暗
+RED    = fg('1;31')     # 亮红（点缀）
+DRED   = fg('31')       # 暗红
+SEAL   = fg('41;1;37')  # 反色（印章）
+
+SLAB_W = 56
+SLAB_L = (COLS - SLAB_W) // 2
+INNER  = SLAB_W - 4
+
+# 真实启动阶段（用于把动画进度对齐到实际系统状态）
+STAGES = [
+    ("mounting /boot",         None),
+    ("loading kernel modules", None),
+    ("starting systemd-udevd", "systemd-udevd.service"),
+    ("starting NetworkManager", "NetworkManager.service"),
+    ("starting systemd-resolved", "systemd-resolved.service"),
+    ("starting ssh",           "ssh.service"),
+    ("starting lightdm",       "lightdm.service"),
+    ("launching labwc",        "lightdm.service"),
+    ("starting fcitx5",        None),
+    ("ready",                  None),
+]
+
+
+_active_cache = {}
+
+def active(unit, ttl=0.6):
+    """带缓存的 is-active 查询。
+
+    ★ 性能关键：subprocess.run 每次约 15-20ms。
+      如果每帧都查，动画帧率会被拖到 8fps（实测）。
+      缓存 0.6 秒后，查询开销摊薄到几乎为零。
+    """
+    if not unit:
+        return False
+    now = time.time()
+    hit = _active_cache.get(unit)
+    if hit and (now - hit[1]) < ttl:
+        return hit[0]
+    try:
+        import subprocess
+        r = subprocess.run(['systemctl', 'is-active', '--quiet', unit],
+                           timeout=2).returncode == 0
+    except Exception:
+        r = False
+    _active_cache[unit] = (r, now)
+    return r
+
+
+# ──────────────────────────────────────────────────────────────────
+#  老电视故障效果（雪花 / 串扰 / 撕裂 / 信号丢失 / 滚动条带）
+#
+#  设计要点：
+#   * **分层干扰**：文字层保持可读，噪声主要落在空白区
+#   * **周期性爆发**：稳定 → 抖动 → 恢复（不是持续噪声，那样太吵）
+#     这既符合真实老电视观感，也呼应 Control 的"现实周期性破裂"
+#   * **关键行保护**：设备名/进度/阶段文字禁止撕裂与字符替换，
+#     否则用户看不清开机进度（实测会把 "POCKETTERM" 打成乱码）
+# ──────────────────────────────────────────────────────────────────
+
+NOISE_CHARS = " ░▒█·.:+*#|/"
+
+# 承载"必须可读"信息的行特征
+PROTECTED_KEYS = (
+    'P O C K E T T E R M',    # 设备名
+    'RESONANCE FIELD',        # 共振进度条
+    'starting',               # 阶段文字
+    '+ ',                     # 百分比
+)
+
+
+class GlitchCycle:
+    """故障状态机：稳定 <-> 爆发 交替"""
+    def __init__(self, seed=None):
+        self.rng = random.Random(seed)
+        self.burst = 0
+        self.cooldown = 25
+
+    def step(self):
+        """返回当前故障强度 0.0（稳定）.. 1.0（严重）"""
+        if self.burst > 0:
+            self.burst -= 1
+            return 0.15 + self.rng.random() * 0.85
+        self.cooldown -= 1
+        if self.cooldown <= 0:
+            if self.rng.random() < 0.30:
+                self.burst = self.rng.randint(3, 8)
+                self.cooldown = self.rng.randint(14, 30)
+                return 0.15 + self.rng.random() * 0.85
+            self.cooldown = self.rng.randint(5, 12)
+        return 0.0
+
+
+def make_noise(rng, density):
+    """雪花噪声网格"""
+    g = [[' '] * COLS for _ in range(ROWS)]
+    if density <= 0:
+        return g
+    for y in range(ROWS):
+        for x in range(COLS):
+            if rng.random() < density:
+                g[y][x] = rng.choice(NOISE_CHARS)
+    return g
+
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+def _plain(s):
+    return _ANSI_RE.sub('', s)
+
+def _is_protected(line):
+    p = _plain(line)
+    return any(k in p for k in PROTECTED_KEYS)
+
+
+def overlay_glitch(lines, noise, rng, intensity):
+    """把雪花/信号丢失/撕裂/场同步失败叠加到已生成的行上"""
+    if intensity <= 0.01:
+        return lines
+    out = list(lines)
+    protected = [_is_protected(l) for l in out]
+
+    # ① 雪花：只填到原本是空白的位置（不覆盖内容）
+    for y in range(min(len(out), ROWS)):
+        raw = out[y]
+        res = []
+        i = 0
+        col = 0
+        while i < len(raw):
+            m = _ANSI_RE.match(raw, i)
+            if m:
+                res.append(m.group(0))
+                i = m.end()
+                continue
+            if col < COLS and raw[i] == ' ' and noise[y][col] != ' ':
+                res.append(f"{DARK}{noise[y][col]}{R}")
+            else:
+                res.append(raw[i])
+            col += 1
+            i += 1
+        out[y] = ''.join(res)
+
+    # ② 信号丢失：随机把块字符换成 ▒（保护行跳过）
+    if intensity > 0.5:
+        for y in range(len(out)):
+            if protected[y]:
+                continue
+            if rng.random() < 0.16 * intensity:
+                out[y] = out[y].replace('█', '▒', rng.randint(1, 3))
+
+    # ③ 横向撕裂：整行左右偏移（保护行跳过）
+    if intensity > 0.55:
+        for _ in range(rng.randint(1, 2)):
+            y = rng.randrange(len(out))
+            if protected[y]:
+                continue
+            sh = rng.choice([-2, -1, 1, 2])
+            plain = _plain(out[y])
+            if sh > 0:
+                newp = ' ' * sh + plain[:-sh]
+            else:
+                k = -sh
+                newp = plain[k:] + ' ' * k
+            out[y] = f"{DARK}{newp}{R}"
+
+    # ④ 场同步失败：整屏上移一行
+    if intensity > 0.85:
+        out = out[1:] + [f"{DARK}{' ' * COLS}{R}"]
+    return out
+
+
+def build_frame(t, pct, stage_idx, stage_txt, scan, intensity=0.0, rng=None, noise=None):
+    """构造一帧（返回行列表）"""
+    pulse = (math.sin(t * 2.2) + 1) / 2
+    # 注意：真机实测 Terminus 缺 █▓·，改用已验证的 █ 与 +
+    core = '█' if pulse > 0.5 else ('+' if pulse > 0.25 else '-')
+    amp  = 0.5 + 0.5 * math.sin(t * 1.7)
+    amp2 = 0.5 + 0.5 * math.sin(t * 1.3 + 1.1)
+    n1 = int(amp * 26)
+    n2 = int(amp2 * 26)
+
+    L = []
+    A = L.append
+    # ── FBC 档案头 ──
+    A(f" {DIM}{'─' * 78}{R}")
+    A(f" {DARK}FEDERAL BUREAU OF CONTROL{R}   {DIM}/{R}   {DARK}POCKET TERMINAL UNIT{R}")
+    A(f" {DIM}{'─' * 78}{R}")
+    A("")
+    # 印章：红底宽度必须精确等于文字宽度（否则反色块会溢出，真机实测过）
+    seal_txt = " RESTRICTED "
+    A(f"  {DIM}CASE{R} {DARK}35-X{R}      {DIM}CLASSIFICATION{R}  "
+      f"{SEAL}{seal_txt}{R}")
+    A("")
+    # ── 碑体 ──
+    A(f"{' ' * SLAB_L}{DIM}┌{'─' * (SLAB_W - 2)}┐{R}")
+    for i in range(16):
+        hit = (i == scan)
+        core_seg = None
+        if i == 4:
+            txt = "P O C K E T T E R M   3 5"
+            l = (INNER - len(txt)) // 2
+            core_seg = f"{DARK}{' ' * l}{R}{BRIGHT}{txt}{R}"
+        elif i == 5:
+            txt = "─" * 21
+            l = (INNER - len(txt)) // 2
+            core_seg = f"{DARK}{' ' * l}{R}{DIM}{txt}{R}"
+        elif i == 8:
+            seg = "[ %s ]" % core
+            l = (INNER - len(seg)) // 2
+            core_seg = f"{DARK}{' ' * l}{R}{DIM}[{R} {RED}{core}{R} {DIM}]{R}"
+        elif i == 10:
+            txt = "+ %3d%%" % pct
+            l = (INNER - len(txt)) // 2
+            core_seg = f"{DARK}{' ' * l}{R}{DIM}{txt}{R}"
+        elif i == 12:
+            l = (INNER - len(stage_txt)) // 2
+            if l < 1:
+                l = 1
+            core_seg = f"{DARK}{' ' * l}{R}{GRAY}{stage_txt}{R}"
+        # 补齐到 INNER 可见宽度
+        if core_seg is None:
+            core_seg = f"{DIM}{'░' * INNER}{R}" if hit else f"{DARK}{' ' * INNER}{R}"
+        else:
+            # 计算已占用的可见宽度，补足尾部空格（用顶层 _ANSI_RE）
+            used = len(_ANSI_RE.sub('', core_seg))
+            if used < INNER:
+                core_seg += f"{DARK}{' ' * (INNER - used)}{R}"
+        A(f"{' ' * SLAB_L}{GRAY}│{R} {core_seg}{GRAY} │{R}")
+    A(f"{' ' * SLAB_L}{DIM}└{'─' * (SLAB_W - 2)}┘{R}")
+    A("")
+    # ── 共振仪表（把真实启动进度映射成"共振振幅"）──
+    A(f"  {DARK}RESONANCE FIELD{R}  {DIM}╱╱╱{R}  {DRED}{'█' * n1}{DIM}{'░' * (26 - n1)}{R}  {BRIGHT}{pct:3d}%{R}")
+    A(f"  {DARK}HISS LEVEL{R}       {DIM}╱╱╱{R}  {DIM}{'▒' * n2}{'░' * (26 - n2)}{R}  {DARK}{100 - pct:3d}%{R}")
+    A("")
+    tail = f"  {DARK}> RESONANCE AMPLIFIER ONLINE{R}   {DIM}//{R}   {DARK}HEDRON STABLE{R}"
+    if pct > 90:
+        tail += f"   {DRED}< SIGNAL{R}"
+    A(tail)
+    if intensity > 0.01 and rng is not None and noise is not None:
+        L = overlay_glitch(L, noise, rng, intensity)
+    return L
+
+
+def main():
+    if '--help' in sys.argv or '-h' in sys.argv:
+        print(__doc__)
+        return 0
+    to_stdout = '--stdout' in sys.argv
+    frames_limit = None
+    for i, a in enumerate(sys.argv):
+        if a == '--frames' and i + 1 < len(sys.argv):
+            frames_limit = int(sys.argv[i + 1])
+
+    out_path = '/dev/stdout' if to_stdout else '/dev/tty1'
+    try:
+        out = open(out_path, 'w', buffering=1)
+    except OSError as e:
+        print(f'cannot open {out_path}: {e}', file=sys.stderr)
+        return 1
+
+    def w(s):
+        try:
+            out.write(s)
+        except OSError:
+            pass
+
+    w(E + '[?25l')       # 隐藏光标
+    w(E + '[2J' + E + '[H')
+
+    # 时序：总时长约 28 秒（对齐 kmscon 接管时间）
+    # 时序：真机实测帧构造约 8ms/帧，加上 sleep 后实际约 55ms/帧。
+    # 目标 25 秒跑完 100%（kmscon 约 30 秒接管，留出余量）。
+    FPS = 18.0
+    TOTAL = 110          # ≈11 秒（实测 tty 写入慢，设计值的一半）
+    frame = 0
+    scan = -1
+    stage_idx = 0
+    # 故障效果状态
+    rng = random.Random()
+    cyc = GlitchCycle()
+    roll = -99.0
+    if not to_stdout:
+        rng.seed(int(time.time() * 1000) & 0xffffffff)
+
+    try:
+        while frame < TOTAL:
+            if frames_limit is not None and frame >= frames_limit:
+                break
+            t = frame / FPS
+            # 进度：前 80% 时间线性推到 92%，后 20% 慢推到 100%
+            frac = frame / float(TOTAL)
+            # 前 90% 时间到 94%，最后 10% 收尾到 100%
+            if frac < 0.90:
+                pct = int(frac / 0.90 * 94)
+            else:
+                pct = int(94 + (frac - 0.90) / 0.10 * 6)
+            pct = max(0, min(100, pct))
+
+            # 阶段：优先跟随真实服务状态
+            si = min(len(STAGES) - 1, int(frac * len(STAGES) * 1.05))
+            # 每 12 帧才查一次真实服务状态（缓存已让单次查询很便宜，
+            # 但减少调用次数能让帧率更稳）
+            if frame % 12 == 0:
+                for j in range(len(STAGES) - 1, -1, -1):
+                    if STAGES[j][1] and active(STAGES[j][1]):
+                        si = max(si, j)
+                        break
+                globals()['_si_cached'] = si
+            else:
+                si = max(si, globals().get('_si_cached', 0))
+            # 老电视故障：先算强度（下面阶段文字要用），再算扫描线/噪声
+            intensity = cyc.step()
+            roll -= 0.45
+            if roll < -3:
+                roll = 28.0
+            # 噪声场每 3 帧才重新生成（整屏 2400 格遍历，没必要每帧做）
+            if frame % 3 == 0 or intensity > 0.5:
+                noise = make_noise(rng, 0.010 + intensity * 0.055)
+                globals()['_noise_cache'] = noise
+            else:
+                noise = globals().get('_noise_cache') or make_noise(rng, 0.012)
+
+            stage_txt = STAGES[si][0]
+            if intensity > 0.7:
+                stage_txt = "SIGNAL DEGRADED - RECOVERING"
+
+            scan = int((t * 3.4) % 20) - 2
+
+            lines = build_frame(t, pct, si, stage_txt, scan,
+                                intensity=intensity, rng=rng, noise=noise)
+            buf = [E + '[H']
+            for i in range(ROWS):
+                buf.append(lines[i] if i < len(lines) else '')
+                buf.append(E + '[K')
+                if i < ROWS - 1:
+                    buf.append('\n')
+            w(''.join(buf))
+
+            # kmscon 起来就让位
+            if not to_stdout and frame > 60 and frame % 12 == 0 and active('lightdm.service'):
+                break
+
+            time.sleep(1.0 / FPS)
+            frame += 1
+    except (KeyboardInterrupt, BrokenPipeError):
+        pass
+    finally:
+        w(E + '[?25h' + E + '[2J' + E + '[H')
+        try:
+            out.close()
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

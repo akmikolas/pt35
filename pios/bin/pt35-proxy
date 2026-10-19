@@ -1,0 +1,170 @@
+#!/bin/bash
+# help: 网络 | 代理一站式管理（状态/测速/拉订阅/在代理下执行命令）
+#
+# 用法:
+#   pt35-proxy                  查看状态（服务/SOCKS端口/出口IP/连通性）
+#   pt35-proxy on               打印 source 命令，开启当前 shell 的代理
+#   pt35-proxy test             测试代理连通性（出口 IP + Google 204 + 延迟）
+#   pt35-proxy run <命令...>    在代理下执行一条命令（不动当前 shell 环境）
+#   pt35-proxy update           拉取订阅更新节点（subs fetch --all）
+#   pt35-proxy nodes            列出可用节点数量与前几个备注
+#   pt35-proxy retest           重新测速所有节点，生成 valid.txt 并按速度排序
+#   pt35-proxy restart          重启代理服务
+#   pt35-proxy log              看代理日志（尾随）
+#   pt35-proxy -h|--help        显示本帮助
+#
+# 背景:
+#   xray-knife 跑本地 SOCKS5 代理（127.0.0.1:9999），每 600 秒自动轮换节点。
+#   **用户名/密码每次启动随机生成**，存在 /run/xray-knife-proxy.env，
+#   所以不能写死。本脚本负责读取并在需要时传给 curl。
+#
+# 相关文件:
+#   /usr/local/lib/xray-knife-run.sh    启动脚本（服务调用）
+#   /run/xray-knife-proxy.env           本次随机凭据（重启后变）
+#   /run/xray-knife-proxy.log           运行日志（含当前节点、轮换倒计时）
+#   /root/valid.txt                     可用节点列表（按延迟排序）
+#   /root/.xray-knife/xray-knife.db     订阅与节点数据库（SQLite）
+#   /etc/xray-knife/socks-credentials   固定凭据？？（实际服务用随机的）
+#
+# 详细文档: /root/XRAY-KNIFE.md
+
+set -u
+
+ENVF=/run/xray-knife-proxy.env
+LOG=/run/xray-knife-proxy.log
+SVC=xray-knife-proxy
+KV=/usr/local/bin/xray-knife
+SOCKS=127.0.0.1:9999
+
+r() { printf '\033[0m'; }
+ok()   { printf '\033[32m%s\033[0m' "$1"; }
+bad()  { printf '\033[31m%s\033[0m' "$1"; }
+dim()  { printf '\033[90m%s\033[0m' "$1"; }
+ttl()  { printf '\033[1;37m%s\033[0m' "$1"; }
+
+load_env() {
+    if [ ! -r "$ENVF" ]; then
+        echo "❌ 凭据文件不存在: $ENVF" >&2
+        echo "   试试: pt35-proxy restart" >&2
+        return 1
+    fi
+    # shellcheck disable=SC1090
+    . "$ENVF"
+    : "${XRAY_SOCKS_USER:?}" "${XRAY_SOCKS_PASS:?}"
+}
+
+cmd_status() {
+    ttl "xray-knife 代理状态"; echo
+    printf '  服务      %s  (enabled=%s)\n' \
+        "$(systemctl is-active --quiet $SVC && ok active || bad "$(systemctl is-active $SVC)")" \
+        "$(systemctl is-enabled $SVC 2>/dev/null)"
+    printf '  版本      %s\n' "$($KV --version 2>&1 | head -1)"
+    printf '  监听      %s\n' "$(ss -ltn 2>/dev/null | awk '$4 ~ /:9999$/ {print $4}' | head -1 || echo 未监听)"
+    if load_env 2>/dev/null; then
+        printf '  凭据      %s:%s…  %s\n' "$XRAY_SOCKS_USER" "${XRAY_SOCKS_PASS:0:6}" "$(dim '（每次重启随机）')"
+    fi
+    # 当前节点
+    CUR=$(grep -a 'Switched to:' "$LOG" 2>/dev/null | tail -1 | sed -E 's#.*Switched to: ##; s#\?.*##; s#(vless|vmess|trojan|ss)://[^@]*@#\1://***@#')
+    [ -n "${CUR:-}" ] && printf '  当前节点  %s\n' "$CUR"
+    NXT=$(grep -ao 'Next rotation in [0-9hms]*' "$LOG" 2>/dev/null | tail -1)
+    [ -n "${NXT:-}" ] && printf '  轮换      %s\n' "$NXT"
+    printf '  节点池    %s 个可用\n' "$(wc -l < /root/valid.txt 2>/dev/null || echo 0)"
+    echo
+    cmd_test
+}
+
+cmd_test() {
+    if ! load_env 2>/dev/null; then return 1; fi
+    printf '  出口 IP   '
+    IP=$(curl -sS --max-time 20 --socks5-hostname "$SOCKS" \
+         --proxy-user "$XRAY_SOCKS_USER:$XRAY_SOCKS_PASS" \
+         https://api.ipify.org 2>&1 | head -1)
+    case "$IP" in
+        *[!0-9.]*|'') bad "失败 ($IP)" ;;
+        *) ok "$IP" ;;
+    esac
+    printf '  Google    '
+    C=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 --socks5-hostname "$SOCKS" \
+        --proxy-user "$XRAY_SOCKS_USER:$XRAY_SOCKS_PASS" \
+        https://www.google.com/generate_204 2>/dev/null)
+    [ "$C" = "204" ] && ok "204 ✅" || bad "$C"
+    printf '  延迟      '
+    T=$(curl -sS -o /dev/null -w '%{time_total}' --max-time 20 --socks5-hostname "$SOCKS" \
+        --proxy-user "$XRAY_SOCKS_USER:$XRAY_SOCKS_PASS" \
+        https://www.google.com/generate_204 2>/dev/null)
+    printf '%s\n' "${T:-?}s"
+}
+
+cmd_on() {
+    load_env || return 1
+    printf '在当前 shell 执行:\n\n  '
+    printf '%s\n' "source /usr/local/bin/proxyenv"
+    printf '\n或手动导出（等价）:\n\n'
+    printf '  export ALL_PROXY="socks5h://%s:%s@%s"\n' "$XRAY_SOCKS_USER" "$XRAY_SOCKS_PASS" "$SOCKS"
+    printf '  export http_proxy="$ALL_PROXY" https_proxy="$ALL_PROXY"\n'
+    printf '\n关闭: unset ALL_PROXY http_proxy https_proxy\n'
+}
+
+cmd_run() {
+    [ $# -gt 0 ] || { echo "用法: pt35-proxy run <命令...>" >&2; return 2; }
+    load_env || return 1
+    ALL_PROXY="socks5h://$XRAY_SOCKS_USER:$XRAY_SOCKS_PASS@$SOCKS" \
+    http_proxy="socks5h://$XRAY_SOCKS_USER:$XRAY_SOCKS_PASS@$SOCKS" \
+    https_proxy="socks5h://$XRAY_SOCKS_USER:$XRAY_SOCKS_PASS@$SOCKS" \
+    NO_PROXY="localhost,127.0.0.1,::1,192.168.0.0/16,100.64.0.10/10" \
+        "$@"
+}
+
+cmd_update() {
+    ttl "拉取订阅更新"; echo
+    "$KV" subs fetch --all 2>&1 | tail -20
+    echo
+    printf '  节点池现在: %s 个\n' "$(wc -l < /root/valid.txt 2>/dev/null || echo 0)"
+    printf '  %s 记得重新测速: pt35-proxy retest\n' "$(dim '提示:')"
+}
+
+cmd_nodes() {
+    printf '  池文件 /root/valid.txt: %s 个节点\n' "$(wc -l < /root/valid.txt 2>/dev/null || echo 0)"
+    echo
+    ttl "  数据库订阅"; echo
+    sqlite3 -column /root/.xray-knife/xray-knife.db \
+        "SELECT id, substr(url,1,50)||'…' AS url, enabled, last_fetched_at FROM subscriptions;" 2>/dev/null \
+        | sed 's/^/    /'
+    echo
+    ttl "  节点备注（前 12）"; echo
+    sed -E 's#.*#\&#; s#.*#&#' /dev/null 2>/dev/null
+    awk -F'#' 'NF>1 {print "    " $NF}' /root/valid.txt 2>/dev/null | head -12
+}
+
+cmd_retest() {
+    ttl "重新测速（会写回 valid.txt，按延迟排序）"; echo
+    printf '  %s\n' "$(dim '节点多时可能几分钟；输出实时显示')"
+    echo
+    "$KV" http -f /root/valid.txt 2>&1 | tail -30
+    echo
+    printf '  测速后节点池: %s 个\n' "$(wc -l < /root/valid.txt 2>/dev/null || echo 0)"
+}
+
+cmd_restart() {
+    systemctl restart $SVC && echo "  ✅ 已重启，等待凭据生成…"
+    for i in $(seq 1 30); do
+        sleep 1
+        [ -r "$ENVF" ] && grep -q XRAY_SOCKS_USER "$ENVF" 2>/dev/null && break
+    done
+    sleep 2
+    cmd_status
+}
+
+case "${1:-}" in
+    ''|status)   cmd_status ;;
+    on)          cmd_on ;;
+    test)        cmd_test ;;
+    run)         shift; cmd_run "$@" ;;
+    update)      cmd_update ;;
+    nodes)       cmd_nodes ;;
+    retest)      cmd_retest ;;
+    restart)     cmd_restart ;;
+    log)         tail -f "$LOG" ;;
+    -h|--help)   sed -n '2,30p' "$0" | sed 's/^# \?//' ;;
+    *)           echo "未知参数: $1（试 pt35-proxy --help）" >&2; exit 2 ;;
+esac

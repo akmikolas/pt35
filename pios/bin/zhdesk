@@ -1,0 +1,66 @@
+#!/bin/bash
+# help: 桌面 | 打开全屏中文终端（foot + fcitx5）
+# zhdesk —— 打开 PocketTerm35 的全屏中文终端
+#
+# Raspberry Pi OS 版说明：
+#   本机桌面是 **labwc**（Pi OS 官方 Wayland 合成器，由 lightdm 启动），
+#   已经在跑。所以这个命令不再需要启动合成器（那是 Arch/sway 时代的做法），
+#   只负责在现有会话里开一个全屏 foot。
+#
+#   Arch 版为什么复杂：那边没有桌面环境，必须先停 kmscon 释放 DRM master
+#   才能启 sway。这边这些坑全都不存在。
+#
+# 用法:
+#   zhdesk              打开全屏终端（新窗口）
+#   zhdesk --here       在当前终端里说明怎么用
+#   zhdesk --check      检查桌面/输入法状态
+set -u
+
+GRE=$'\033[32m'; RED=$'\033[31m'; YEL=$'\033[33m'; DIM=$'\033[2m'; RST=$'\033[0m'
+
+# ── 补齐 Wayland 环境（从 SSH 调用时必需）──────────────
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    _wd=$(ls "$XDG_RUNTIME_DIR"/wayland-* 2>/dev/null | grep -v '\.lock$' | head -1)
+    [ -n "$_wd" ] && export WAYLAND_DISPLAY=$(basename "$_wd")
+fi
+: "${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}"
+export DBUS_SESSION_BUS_ADDRESS
+
+# ── 输入法环境 ─────────────────────────────────────
+export GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx
+export SDL_IM_MODULE=fcitx GLFW_IM_MODULE=ibus
+
+case "${1:-}" in
+  --check)
+    echo "┌─ 桌面与输入法状态 ──────────────────────────────"
+    printf "│ %-12s %s\n" "会话类型" "${XDG_SESSION_TYPE:-未知}"
+    printf "│ %-12s %s\n" "桌面" "${XDG_CURRENT_DESKTOP:-未知}"
+    printf "│ %-12s %s\n" "WAYLAND" "${WAYLAND_DISPLAY:-未设置}"
+    printf "│ %-12s %s\n" "labwc" "$(pgrep -x labwc >/dev/null && echo "运行中 pid=$(pgrep -x labwc)" || echo '未运行')"
+    printf "│ %-12s %s\n" "fcitx5" "$(pgrep -x fcitx5 >/dev/null && echo "运行中 pid=$(pgrep -x fcitx5)" || echo '未运行')"
+    printf "│ %-12s %s\n" "foot" "$(command -v foot >/dev/null && foot --version 2>&1 | head -1 || echo '未安装')"
+    printf "│ %-12s %s\n" "中文字体" "$(fc-list :lang=zh 2>/dev/null | wc -l) 个"
+    echo "└─────────────────────────────────────────────────"
+    ;;
+  --here|"")
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        echo "${GRE}打开全屏 foot…${RST}"
+        exec foot
+    else
+        echo "${RED}没有可用的 Wayland 显示${RST}"
+        echo "${DIM}  如果在 SSH 里，先确认桌面在跑:${RST}"
+        echo "${DIM}    ls \$XDG_RUNTIME_DIR/wayland-*${RST}"
+        echo "${DIM}  或者用 --check 看状态${RST}"
+        exit 1
+    fi
+    ;;
+  -h|--help)
+    sed -n '2,20p' "$0" | sed 's/^# \?//'
+    ;;
+  *)
+    echo "未知参数: $1（用 --help 看用法）" >&2
+    exit 2
+    ;;
+esac

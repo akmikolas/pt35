@@ -1,0 +1,54 @@
+#!/bin/bash
+# help: 桌面 | 检查/启用桌面自动登录
+# pt35-desktop-boot —— 管理开机自动进入图形桌面
+#
+# Raspberry Pi OS 默认 lightdm 自动登录到 labwc 桌面。
+# 如果某次开机进了文字终端（tty），多半是这个没启用。
+#
+# 用法:
+#   pt35-desktop-boot            查看当前状态
+#   pt35-desktop-boot --enable   启用自动登录
+#   pt35-desktop-boot --disable  关闭自动登录（开机进文字终端）
+set -u
+G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'
+CONF=/etc/lightdm/lightdm.conf.d/50-pt35-autologin.conf
+USER_NAME="${SUDO_USER:-frank}"
+
+status() {
+    echo "${D}── 自动登录状态 ──${N}"
+    printf "  %-16s %s\n" "lightdm" "$(systemctl is-enabled lightdm 2>/dev/null) / $(systemctl is-active lightdm 2>/dev/null)"
+    printf "  %-16s %s\n" "graphical.target" "$(systemctl get-default 2>/dev/null)"
+    if [ -f "$CONF" ]; then
+        printf "  %-16s %s\n" "自动登录" "${G}已启用${N} ($USER_NAME)"
+        grep -E "autologin-user|autologin-session" "$CONF" 2>/dev/null | sed 's/^/      /'
+    else
+        printf "  %-16s %s\n" "自动登录" "${Y}未配置${N}"
+    fi
+}
+
+case "${1:-}" in
+  --enable|enable)
+      sudo mkdir -p "$(dirname "$CONF")"
+      sudo tee "$CONF" >/dev/null <<EOF
+[Seat:*]
+autologin-user=$USER_NAME
+autologin-user-timeout=0
+autologin-session=rpd-labwc
+user-session=rpd-labwc
+EOF
+      sudo systemctl set-default graphical.target
+      echo "  ${G}✓${N} 已启用自动登录 → $USER_NAME / rpd-labwc"
+      echo "  ${D}下次开机会直接进入桌面${N}"
+      status
+      ;;
+  --disable|disable)
+      sudo rm -f "$CONF"
+      echo "  ${G}✓${N} 已关闭自动登录（开机会停在文字登录）"
+      status
+      ;;
+  *)
+      status
+      echo
+      echo "  ${D}--enable 启用 / --disable 关闭${N}"
+      ;;
+esac

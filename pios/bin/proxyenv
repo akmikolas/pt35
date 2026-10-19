@@ -1,0 +1,14 @@
+#!/bin/bash
+# help: 网络 | 载入代理环境变量（source 用）
+# 载入 xray-knife 代理环境变量：  source /usr/local/bin/proxyenv
+ENV=/run/xray-knife-proxy.env
+if [ ! -r "$ENV" ]; then
+  echo "代理未运行或凭据未就绪，试试: systemctl restart xray-knife-proxy" >&2
+  return 1 2>/dev/null || exit 1
+fi
+. "$ENV"
+export ALL_PROXY http_proxy https_proxy
+export HTTP_PROXY="$http_proxy" HTTPS_PROXY="$https_proxy"
+export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.10/10,.local"
+export no_proxy="$NO_PROXY"
+echo "代理已开启: socks5h://127.0.0.1:9999 (出口随节点自动轮换)"
